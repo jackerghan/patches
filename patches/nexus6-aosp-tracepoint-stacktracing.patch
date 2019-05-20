@@ -1,0 +1,67 @@
+From 1728b5be7e679d9f49396a995ca69d9d7ca24c36 Mon Sep 17 00:00:00 2001
+From: JackE <jacke@fb.com>
+Date: Fri, 17 May 2019 14:49:18 -0700
+Subject: [PATCH 3/3] Stack tracing for tracepoint events, simpleperf stack
+ filtering
+
+---
+ shamu/arch/arm/include/asm/perf_event.h |  9 +++++++++
+ shamu/kernel/events/core.c              | 10 +++++++++-
+ 2 files changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/shamu/arch/arm/include/asm/perf_event.h b/shamu/arch/arm/include/asm/perf_event.h
+index 755877527..2f00ca397 100644
+--- a/shamu/arch/arm/include/asm/perf_event.h
++++ b/shamu/arch/arm/include/asm/perf_event.h
+@@ -28,4 +28,13 @@ extern unsigned long perf_misc_flags(struct pt_regs *regs);
+ #define perf_misc_flags(regs)	perf_misc_flags(regs)
+ #endif
+ 
++register unsigned long perf_current_stack_pointer asm ("sp");
++
++#define perf_arch_fetch_caller_regs(regs, __ip) { \
++    (regs)->ARM_pc = (__ip); \
++    (regs)->ARM_fp = (unsigned long) __builtin_frame_address(0); \
++    (regs)->ARM_sp = perf_current_stack_pointer; \
++    (regs)->ARM_cpsr = SVC_MODE; \
++}
++
+ #endif /* __ARM_PERF_EVENT_H__ */
+diff --git a/shamu/kernel/events/core.c b/shamu/kernel/events/core.c
+index d8a33cbc9..8434c5c97 100644
+--- a/shamu/kernel/events/core.c
++++ b/shamu/kernel/events/core.c
+@@ -44,6 +44,10 @@
+ 
+ #include <asm/irq_regs.h>
+ 
++static int no_stacks_for_current_task(void ) {
++	return (strcmp(current->comm, "simpleperf") == 0);
++}
++
+ struct remote_function_call {
+ 	struct task_struct	*p;
+ 	int			(*func)(void *info);
+@@ -4168,6 +4172,10 @@ perf_sample_ustack_size(u16 stack_size, u16 header_size,
+ 	if (!regs)
+ 		return 0;
+ 
++	if (no_stacks_for_current_task()) {
++		return 0;
++	}
++
+ 	/*
+ 	 * Check if we fit in with the requested stack size into the:
+ 	 * - TASK_SIZE
+@@ -4202,7 +4210,7 @@ perf_output_sample_ustack(struct perf_output_handle *handle, u64 dump_size,
+ 			  struct pt_regs *regs)
+ {
+ 	/* Case of a kernel thread, nothing to dump */
+-	if (!regs) {
++	if (!regs || no_stacks_for_current_task()) {
+ 		u64 size = 0;
+ 		perf_output_put(handle, size);
+ 	} else {
+-- 
+2.17.1
+

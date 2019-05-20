@@ -1,0 +1,194 @@
+From 9cd22e280543c715f81cadd95ad8caf16198034d Mon Sep 17 00:00:00 2001
+From: JackE <jacke@fb.com>
+Date: Tue, 30 Apr 2019 07:16:27 -0700
+Subject: [PATCH 3/4] Pagefault tracing, filter stacks for events logged from
+ simpleperf processs itself
+
+---
+ arch/arm/mm/fault.c              | 51 ++++++++++++++++++++++++++++----
+ include/trace/events/exception.h | 41 +++++++++++++++++++++++++
+ kernel/events/core.c             | 12 ++++++--
+ 3 files changed, 97 insertions(+), 7 deletions(-)
+
+diff --git a/arch/arm/mm/fault.c b/arch/arm/mm/fault.c
+index c2250c5b806..945a664c4da 100644
+--- a/arch/arm/mm/fault.c
++++ b/arch/arm/mm/fault.c
+@@ -209,8 +209,10 @@ void do_bad_area(unsigned long addr, unsigned int fsr, struct pt_regs *regs)
+ }
+ 
+ #ifdef CONFIG_MMU
+-#define VM_FAULT_BADMAP		0x010000
+-#define VM_FAULT_BADACCESS	0x020000
++#define VM_FAULT_BADMAP		   0x010000
++#define VM_FAULT_BADACCESS	 0x020000
++#define VM_FAULT_LOG_VMOPS  0x1000000
++#define VM_FAULT_LOG_USER   0x2000000
+ 
+ /*
+  * Check that the permissions on the VMA allow for the fault which occurred.
+@@ -230,7 +232,7 @@ static inline bool access_error(unsigned int fsr, struct vm_area_struct *vma)
+ }
+ 
+ static int __kprobes
+-__do_page_fault(struct mm_struct *mm, unsigned long addr, unsigned int fsr,
++__do_page_fault(struct mm_struct *mm, unsigned long addr, unsigned long faulting_pc, unsigned int fsr,
+ 		unsigned int flags, struct task_struct *tsk)
+ {
+ 	struct vm_area_struct *vma;
+@@ -253,7 +255,46 @@ good_area:
+ 		goto out;
+ 	}
+ 
+-	return handle_mm_fault(mm, vma, addr & PAGE_MASK, flags);
++	fault = handle_mm_fault(mm, vma, addr & PAGE_MASK, flags);
++	if (!(fault & VM_FAULT_ERROR) && flags & FAULT_FLAG_ALLOW_RETRY) {
++		// Only want to log interesting faults: mapped or any hardfault for now.
++		// Later it may be interesting to log COW, stack growth etc.
++		if (atomic_read(&__tracepoint_page_fault_filt.key.enabled) > 0) {
++			int simpleperf = !strcmp(current->comm, "simpleperf");
++			if (!simpleperf && ((fault & VM_FAULT_MAJOR) || vma->vm_ops)) {
++				// Only log interesting faults: hard faults and ...
++				int log_flags = fault;
++				char* path = "";
++				char buf[256];
++				dev_t dev = 0;
++				ino_t ino = 0;
++				unsigned long vma_pgoff = 0;
++
++				if (vma->vm_ops) {
++					log_flags |= VM_FAULT_LOG_VMOPS;
++				}
++				if (flags & FAULT_FLAG_USER) {
++					log_flags |= VM_FAULT_LOG_USER;
++				}
++
++				if (vma->vm_file && vma->vm_file->f_mapping && vma->vm_file->f_mapping->host) {
++					struct inode *inode = vma->vm_file->f_mapping->host;
++					dev = inode->i_sb->s_dev;
++					ino = inode->i_ino;
++					path = d_path(&vma->vm_file->f_path, buf, sizeof(buf));
++					if (IS_ERR(path)) {
++						snprintf(buf, sizeof(buf), "<error:%ld>", PTR_ERR(path));
++						path = buf;
++					}
++				}
++
++				vma_pgoff = (unsigned long)vma->vm_pgoff << PAGE_SHIFT;
++				trace_page_fault_filt(addr, faulting_pc, vma->vm_start, vma->vm_end, vma_pgoff, log_flags, dev, ino, path);
++			}
++		}
++	}
++
++	return fault;
+ 
+ check_stack:
+ 	/* Don't allow expansion below FIRST_USER_ADDRESS */
+@@ -318,7 +359,7 @@ retry:
+ #endif
+ 	}
+ 
+-	fault = __do_page_fault(mm, addr, fsr, flags, tsk);
++	fault = __do_page_fault(mm, addr, regs->ARM_pc, fsr, flags, tsk);
+ 
+ 	/* If we need to retry but a fatal signal is pending, handle the
+ 	 * signal first. We do not need to release the mmap_sem because
+diff --git a/include/trace/events/exception.h b/include/trace/events/exception.h
+index 69dbf7cebdc..d45369a1a99 100644
+--- a/include/trace/events/exception.h
++++ b/include/trace/events/exception.h
+@@ -84,6 +84,47 @@ TRACE_EVENT(unhandled_abort,
+ 	TP_printk("addr:%lu, fsr:%u", __entry->addr, __entry->fsr)
+ );
+ 
++TRACE_EVENT(page_fault_filt,
++
++       TP_PROTO(unsigned long addr, unsigned long faulting_pc, unsigned long vma_start, unsigned long vma_end, unsigned long vma_pgoff, unsigned int flags, dev_t dev, ino_t ino, char* path),
++
++       TP_ARGS(addr, faulting_pc, vma_start, vma_end, vma_pgoff, flags, dev, ino, path),
++
++       TP_STRUCT__entry(
++				 			 __field( unsigned long, addr )
++							 __field( unsigned long, faulting_pc )
++							 __field( unsigned long, vma_start )
++							 __field( unsigned long, vma_end )
++							 __field( unsigned long, vma_pgoff )
++				 			 __field( unsigned int, flags )
++							 __field( dev_t, dev )
++							 __field( ino_t, ino )
++							 __string( path,	path	)
++       ),
++
++       TP_fast_assign(
++				 			 __entry->addr = addr;
++							 __entry->faulting_pc = faulting_pc;
++							 __entry->vma_start = vma_start;
++							 __entry->vma_end = vma_end;
++							 __entry->vma_pgoff = vma_pgoff;
++							 __entry->flags = flags;
++							 __entry->dev = dev;
++							 __entry->ino = ino;
++							 __assign_str( path, path );
++       ),
++
++       TP_printk("%lx %lx %lx %lx %lx %x %d,%d %lu [%s]",
++			 					 __entry->addr,
++								 __entry->faulting_pc,
++								 __entry->vma_start,
++								 __entry->vma_end,
++								 __entry->vma_pgoff,
++								 __entry->flags,
++								 MAJOR(__entry->dev), MINOR(__entry->dev),
++								 (unsigned long)__entry->ino, __get_str(path))
++);
++
+ #endif
+ 
+ #include <trace/define_trace.h>
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+index 9b6e5f21789..665a6269f42 100644
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -52,6 +52,10 @@ struct remote_function_call {
+ 	int			ret;
+ };
+ 
++static int no_stacks_for_current_task(void ) {
++	return (strcmp(current->comm, "simpleperf") == 0);
++}
++
+ static void remote_function(void *data)
+ {
+ 	struct remote_function_call *tfc = data;
+@@ -4104,7 +4108,7 @@ again:
+ 	if (vma->vm_flags & VM_WRITE)
+ 		flags |= RING_BUFFER_WRITABLE;
+ 
+-	rb = rb_alloc(nr_pages, 
++	rb = rb_alloc(nr_pages,
+ 		event->attr.watermark ? event->attr.wakeup_watermark : 0,
+ 		event->cpu, flags);
+ 
+@@ -4297,6 +4301,10 @@ perf_sample_ustack_size(u16 stack_size, u16 header_size,
+ 	if (!regs)
+ 		return 0;
+ 
++	if (no_stacks_for_current_task()) {
++		return 0;
++	}
++
+ 	/*
+ 	 * Check if we fit in with the requested stack size into the:
+ 	 * - TASK_SIZE
+@@ -4331,7 +4339,7 @@ perf_output_sample_ustack(struct perf_output_handle *handle, u64 dump_size,
+ 			  struct pt_regs *regs)
+ {
+ 	/* Case of a kernel thread, nothing to dump */
+-	if (!regs) {
++	if (!regs || no_stacks_for_current_task()) {
+ 		u64 size = 0;
+ 		perf_output_put(handle, size);
+ 	} else {
+-- 
+2.17.1
+

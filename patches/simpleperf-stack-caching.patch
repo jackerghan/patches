@@ -1,0 +1,1842 @@
+From c76ff6c77f20bdb17bb2752c5618202f5686e9fe Mon Sep 17 00:00:00 2001
+From: Jack Erghan <jacke@fb.com>
+Date: Wed, 24 Apr 2019 13:30:30 -0700
+Subject: [PATCH] Stack caching
+
+Change-Id: Ia918ce74badf50e9a869472c3f231ca31fcf6e21
+---
+ simpleperf/RecordReadThread.cpp | 496 ++++++++++++++++++----
+ simpleperf/RecordReadThread.h   |  52 ++-
+ simpleperf/cmd_record.cpp       | 112 ++++-
+ simpleperf/event_fd.h           |   2 +
+ simpleperf/stack_cache.h        | 892 ++++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 1477 insertions(+), 77 deletions(-)
+ create mode 100644 simpleperf/stack_cache.h
+
+diff --git a/simpleperf/RecordReadThread.cpp b/simpleperf/RecordReadThread.cpp
+index 876f4041..017b404c 100644
+--- a/simpleperf/RecordReadThread.cpp
++++ b/simpleperf/RecordReadThread.cpp
+@@ -18,15 +18,23 @@
+ 
+ #include <sys/resource.h>
+ #include <unistd.h>
+-
+ #include <algorithm>
+ #include <unordered_map>
+ 
+ #include "environment.h"
+ #include "record.h"
+ 
++#include "perf_regs.h"
++#include "stack_cache.h"
++
++extern std::string g_thread_filter;
++extern std::string g_process_filter;
++extern bool g_fast_stacks;
++
+ namespace simpleperf {
+ 
++#define PERF_RECORD_SAMPLE_WITH_STACK_REF (0x00080000 | PERF_RECORD_SAMPLE)
++
+ static constexpr size_t kDefaultLowBufferLevel = 10 * 1024 * 1024u;
+ static constexpr size_t kDefaultCriticalBufferLevel = 5 * 1024 * 1024u;
+ 
+@@ -105,17 +113,29 @@ void RecordBuffer::MoveToNextRecord() {
+ }
+ 
+ RecordParser::RecordParser(const perf_event_attr& attr)
+-    : sample_type_(attr.sample_type),
++    : attr_(attr),
++      sample_type_(attr.sample_type),
+       sample_regs_count_(__builtin_popcountll(attr.sample_regs_user)) {
+   size_t pos = sizeof(perf_event_header);
+-  uint64_t mask = PERF_SAMPLE_IDENTIFIER | PERF_SAMPLE_IP | PERF_SAMPLE_TID;
++  if (sample_type_ & PERF_SAMPLE_IDENTIFIER) {
++    sample_id_pos_in_sample_records_ = pos;
++  }
++  uint64_t mask = PERF_SAMPLE_IDENTIFIER | PERF_SAMPLE_IP;
+   pos += __builtin_popcountll(sample_type_ & mask) * sizeof(uint64_t);
++  if (sample_type_ & PERF_SAMPLE_TID) {
++    tid_pos_in_sample_records_ = pos;
++    pos += sizeof(uint64_t);
++  }
+   if (sample_type_ & PERF_SAMPLE_TIME) {
+     time_pos_in_sample_records_ = pos;
+     pos += sizeof(uint64_t);
+   }
+-  mask = PERF_SAMPLE_ADDR | PERF_SAMPLE_ID | PERF_SAMPLE_STREAM_ID | PERF_SAMPLE_CPU |
+-      PERF_SAMPLE_PERIOD;
++  mask = PERF_SAMPLE_ADDR;
++  pos += __builtin_popcountll(sample_type_ & mask) * sizeof(uint64_t);
++  if (sample_type_ & PERF_SAMPLE_ID) {
++    sample_id_pos_in_sample_records_ = pos;
++  }
++  mask = PERF_SAMPLE_ID | PERF_SAMPLE_STREAM_ID | PERF_SAMPLE_CPU | PERF_SAMPLE_PERIOD;
+   pos += __builtin_popcountll(sample_type_ & mask) * sizeof(uint64_t);
+   callchain_pos_in_sample_records_ = pos;
+   if ((sample_type_ & PERF_SAMPLE_TIME) && attr.sample_id_all) {
+@@ -137,7 +157,11 @@ size_t RecordParser::GetTimePos(const perf_event_header& header) const {
+ }
+ 
+ size_t RecordParser::GetStackSizePos(
+-    const std::function<void(size_t,size_t,void*)>& read_record_fn) const{
++    const std::function<void(size_t,size_t,void*)>& read_record_fn,
++    RegsUser* reg_data) const{
++  if (reg_data) {
++    memset(&reg_data->regs, 0, sizeof(reg_data->regs));
++  }
+   size_t pos = callchain_pos_in_sample_records_;
+   if (sample_type_ & PERF_SAMPLE_CALLCHAIN) {
+     uint64_t ip_nr;
+@@ -157,11 +181,32 @@ size_t RecordParser::GetStackSizePos(
+   if (sample_type_ & PERF_SAMPLE_REGS_USER) {
+     uint64_t abi;
+     read_record_fn(pos, sizeof(abi), &abi);
+-    pos += (1 + (abi == 0 ? 0 : sample_regs_count_)) * sizeof(uint64_t);
++    pos += sizeof(abi);
++    if (abi) {
++      if (reg_data) {
++        reg_data->regs.abi = abi;
++        reg_data->regs.reg_mask = attr_.sample_regs_user;
++        reg_data->regs.reg_nr = sample_regs_count_;
++        reg_data->regs.regs = reg_data->data;
++        read_record_fn(pos, sample_regs_count_ * sizeof(uint64_t), reg_data->data);
++      }
++      pos += sample_regs_count_ * sizeof(uint64_t);
++    }
+   }
+   return (sample_type_ & PERF_SAMPLE_STACK_USER) ? pos : 0;
+ }
+ 
++uint64_t RecordParser::GetSampleId(
++    const std::function<void(size_t,size_t,void*)>& read_record_fn) const {
++
++  uint64_t id = 0;
++  if (sample_id_pos_in_sample_records_) {
++    read_record_fn(sample_id_pos_in_sample_records_, sizeof(id), &id);
++  }
++  jk_assert(id);
++  return id;
++}
++
+ KernelRecordReader::KernelRecordReader(EventFd* event_fd) : event_fd_(event_fd) {
+   size_t buffer_size;
+   buffer_ = event_fd_->GetMappedBuffer(buffer_size);
+@@ -187,6 +232,16 @@ void KernelRecordReader::ReadRecord(size_t pos, size_t size, void* dest) {
+   }
+ }
+ 
++uint32_t KernelRecordReader::HashRecord(size_t pos, size_t size) {
++  pos = (pos + data_pos_) & buffer_mask_;
++  size_t hash_size = std::min(size, buffer_mask_ + 1 - pos);
++  uint32_t hash = stk_hash(buffer_ + pos, hash_size);
++  if (hash_size < size) {
++    hash = stk_hash(buffer_, size - hash_size, hash);
++  }
++  return hash;
++}
++
+ bool KernelRecordReader::MoveToNextRecord(const RecordParser& parser) {
+   data_pos_ = (data_pos_ + record_header_.size) & buffer_mask_;
+   data_size_ -= record_header_.size;
+@@ -205,13 +260,13 @@ bool KernelRecordReader::MoveToNextRecord(const RecordParser& parser) {
+ 
+ RecordReadThread::RecordReadThread(size_t record_buffer_size, const perf_event_attr& attr,
+                                    size_t min_mmap_pages, size_t max_mmap_pages)
+-    : record_buffer_(record_buffer_size), record_parser_(attr), attr_(attr),
++    : record_buffer_(record_buffer_size / 8), record_parser_(attr), attr_(attr),
+       min_mmap_pages_(min_mmap_pages), max_mmap_pages_(max_mmap_pages) {
+   if (attr.sample_type & PERF_SAMPLE_STACK_USER) {
+     stack_size_in_sample_record_ = attr.sample_stack_user;
+   }
+-  record_buffer_low_level_ = std::min(record_buffer_size / 4, kDefaultLowBufferLevel);
+-  record_buffer_critical_level_ = std::min(record_buffer_size / 6, kDefaultCriticalBufferLevel);
++  record_buffer_low_level_ = std::min(record_buffer_.size() / 4, kDefaultLowBufferLevel);
++  record_buffer_critical_level_ = std::min(record_buffer_.size() / 6, kDefaultCriticalBufferLevel);
+ }
+ 
+ RecordReadThread::~RecordReadThread() {
+@@ -282,7 +337,40 @@ bool RecordReadThread::SendCmdToReadThread(Cmd cmd, void* cmd_arg) {
+ std::unique_ptr<Record> RecordReadThread::GetRecord() {
+   record_buffer_.MoveToNextRecord();
+   char* p = record_buffer_.GetCurrentRecord();
++  char buffer[64 * 1024];
+   if (p != nullptr) {
++    // If this is a sample with stack, expand to buffer.
++    // Queue stackref to be released.
++    auto header = reinterpret_cast<const perf_event_header*>(p);
++    if (header->type == PERF_RECORD_SAMPLE_WITH_STACK_REF) {
++      size_t stack_size_pos = record_parser_.GetStackSizePos(
++        [&](size_t pos, size_t size, void* dest) {
++          return memcpy(dest, p + pos, size);
++      });
++
++      // Extract the stack reference.
++      stack_cache::stack_ref* stk;
++      memcpy(&stk, p + stack_size_pos, sizeof(size_t));
++      jk_assert(stk->cache() == stack_cache_.get());
++      uint64_t stack_size = stk->size();
++
++      // Copy the first part of the record.
++      copy_target target(buffer, sizeof(buffer));
++      target.copy(p, stack_size_pos);
++      
++      // Copy the stack size, the stack and dynamic stack size.
++      target.copy(&stack_size, sizeof(stack_size));
++      stk->copy(target);
++      stk->queue_release();
++      target.copy(&stack_size, sizeof(stack_size));
++
++      // Fix the header size.
++      p = buffer;
++      auto header_to_fix = reinterpret_cast<perf_event_header*>(p);
++      header_to_fix->type = PERF_RECORD_SAMPLE;
++      header_to_fix->size = (uint16_t)((char*)target.target - buffer);
++    }
++
+     return ReadRecordFromBuffer(attr_, p);
+   }
+   if (has_data_notification_) {
+@@ -295,6 +383,8 @@ std::unique_ptr<Record> RecordReadThread::GetRecord() {
+ 
+ void RecordReadThread::RunReadThread() {
+   IncreaseThreadPriority();
++  stack_cache_.reset(new stack_cache(record_buffer_.size() * 7));
++  stack_cache_->set_allow_thread_stack_reuse(g_fast_stacks);
+   IOEventLoop loop;
+   CHECK(loop.AddReadEvent(read_cmd_fd_, [&]() { return HandleCmd(loop); }));
+   loop.RunLoop();
+@@ -332,6 +422,32 @@ bool RecordReadThread::HandleCmd(IOEventLoop& loop) {
+       result = ReadRecordsFromKernelBuffer();
+       break;
+     case CMD_STOP_THREAD:
++      if (stack_cache_) {
++        stack_cache::stack_stats stk_stats;
++        block_cache::block_stats blk_stats;
++        stack_cache_->get_stats(stk_stats);
++        stack_cache_->get_block_stats(blk_stats);
++        LOG(INFO) << "StackCacheStats: STK " << stk_stats.stacks << " D " << stk_stats.stacks_dropped
++          << " Z " << stk_stats.zero_blocks << " H " << stk_stats.hit_blocks 
++          << " M " << stk_stats.missed_blocks << " P " << stk_stats.partial_blocks
++          << " RU " << stk_stats.reused_thread_blocks << " MU " << stk_stats.mismatch_thread_blocks
++          << " BRU " << stk_stats.bad_reused_thread_blocks
++          << " R " << blk_stats.repurposed_blocks << " BC " << blk_stats.max_blocks_cached
++          << " TS " << blk_stats.max_size_active / 1024 << "KB";
++      }
++      LOG(INFO) << "RecordReaderStats: L " << lost_samples_ << " LN " << lost_non_samples_
++        << " F " << filtered_samples_ << " RS " << removed_stack_samples_
++        << " SO " << stack_optimized_samples_ << " K " << kernel_dropped_samples_;
++
++      period_stats_.push_back(current_period_stats_);
++      for (const auto& stats : period_stats_) {
++        LOG(INFO) << "PeriodStats: T " << nsecToS(stats.time)
++          << " R " << stats.raw_events_read << " / " << (stats.raw_events_read_bytes / 1024) << "KB"
++          << " C " << stats.events_copied << " / " << (stats.events_copied_bytes / 1024) << "KB"
++          << " O " << stats.optimized_events_ << " / " << (stats.optimized_events_bytes / 1024) << "KB"
++          << " K " << stats.kernel_dropped_events_;
++      }
++
+       result = loop.ExitLoop();
+       break;
+     default:
+@@ -348,6 +464,70 @@ bool RecordReadThread::HandleCmd(IOEventLoop& loop) {
+ 
+ bool RecordReadThread::HandleAddEventFds(IOEventLoop& loop,
+                                          const std::vector<EventFd*>& event_fds) {
++
++  for (const auto& event_fd : event_fds) {
++    event_name_map_[event_fd->Id()] = event_fd->EventName();
++    if (event_fd->EventName() == "cpu-cycles") {
++      cpu_sample_ids_.insert(event_fd->Id());
++    }
++  }
++
++  // When we are starting processing, check for thread/process filters. If we have them
++  // we need to populate the existing thread/processes.
++  if (kernel_record_readers_.empty()) {
++    current_period_stats_.time = systemTime();
++    period_stats_.reserve(64);
++
++    filter_by_tid_ = !g_thread_filter.empty();
++    if (filter_by_tid_) {
++      thread_rx_ = std::regex(g_thread_filter);
++    }
++
++    filter_by_pid_ = !g_process_filter.empty();
++    if (filter_by_pid_) {
++      process_rx_ = std::regex(g_process_filter);
++    }
++
++    if (filter_by_tid_ || filter_by_pid_) {
++      std::string name;
++      name.reserve(512);
++      auto pids = GetAllProcesses();
++      for (const auto& pid : pids) {
++
++        if (filter_by_pid_) {
++          if (!GetThreadName(pid, &name)) {
++            continue;
++          }
++
++          bool proc_matched = regex_search(name, process_rx_);
++          if (proc_matched) {
++            LOG(DEBUG) << "INIT, ProcMatch, " << name << " " << pid;
++            stack_allowed_pids_.insert(pid);
++          }
++        }
++
++        if (!filter_by_tid_) {
++          continue;
++        }
++
++        auto tids = GetThreadsInProcess(pid);
++        for (const auto& tid : tids) {
++          if (!GetThreadName(tid, &name)) {
++            continue;
++          }
++
++          bool thread_matched = regex_search(name, thread_rx_);
++          if (!thread_matched) {
++            continue;
++          }
++
++          LOG(DEBUG) << "INIT, ThrdMatch, " << name << " " << tid;
++          stack_allowed_tids_.insert(tid);
++        }
++      }
++    }
++  }
++
+   std::unordered_map<int, EventFd*> cpu_map;
+   for (size_t pages = max_mmap_pages_; pages >= min_mmap_pages_; pages >>= 1) {
+     bool success = true;
+@@ -378,6 +558,7 @@ bool RecordReadThread::HandleAddEventFds(IOEventLoop& loop,
+   if (cpu_map.empty()) {
+     return false;
+   }
++
+   for (auto& pair : cpu_map) {
+     if (!pair.second->StartPolling(loop, [this]() { return ReadRecordsFromKernelBuffer(); })) {
+       return false;
+@@ -389,6 +570,9 @@ bool RecordReadThread::HandleAddEventFds(IOEventLoop& loop,
+ 
+ bool RecordReadThread::HandleRemoveEventFds(const std::vector<EventFd*>& event_fds) {
+   for (auto& event_fd : event_fds) {
++    if (event_fd->EventName() == "cpu-cycles") {
++      cpu_sample_ids_.erase(event_fd->Id());
++    }
+     if (event_fd->HasMappedBuffer()) {
+       auto it = std::find_if(kernel_record_readers_.begin(), kernel_record_readers_.end(),
+                              [&](const KernelRecordReader& reader) {
+@@ -455,80 +639,245 @@ bool RecordReadThread::ReadRecordsFromKernelBuffer() {
+   return true;
+ }
+ 
+-void RecordReadThread::PushRecordToRecordBuffer(KernelRecordReader* kernel_record_reader) {
+-  const perf_event_header& header = kernel_record_reader->RecordHeader();
+-  if (header.type == PERF_RECORD_SAMPLE && stack_size_in_sample_record_ > 1024) {
+-    size_t free_size = record_buffer_.GetFreeSize();
+-    if (free_size < record_buffer_critical_level_) {
+-      // When the free size in record buffer is below critical level, drop sample records to save
+-      // space for more important records (like mmap or fork records).
+-      lost_samples_++;
+-      return;
++void RecordReadThread::UpdateProcessThreadFilters(KernelRecordReader* kernel_record_reader, const perf_event_header& header) {
++  
++  if (!filter_by_tid_ && !filter_by_pid_) {
++    return;
++  }
++
++  if ((header.type != PERF_RECORD_COMM) && (header.type != PERF_RECORD_FORK)) {
++    return;
++  }
++
++  char buffer[4096];
++  kernel_record_reader->ReadRecord(0, std::min((unsigned int)header.size, sizeof(buffer)), buffer);
++  buffer[sizeof(buffer) - 1] = 0;
++  auto br = ReadRecordFromBuffer(attr_, buffer);
++  if (header.type == PERF_RECORD_COMM) {
++    const CommRecord& r = *static_cast<const CommRecord*>(br.get());
++    std::string name = r.comm;
++    // Is the process main thread name changing?
++    if (r.data->pid == r.data->tid) {
++      if (filter_by_pid_) {
++        bool process_match = std::regex_search(name, process_rx_);
++        if (process_match) {
++          LOG(DEBUG) << "RUNT, ProcMatch, " << name << " " << r.data->pid;
++          stack_allowed_pids_.insert(r.data->pid);
++        } else {
++          if (stack_allowed_pids_.erase(r.data->pid)) {
++            LOG(INFO) << "RUNT, ProcMatchNoMore, " << name << " " << r.data->pid;
++          }
++        }     
++      }
+     }
+-    size_t stack_size_limit = stack_size_in_sample_record_;
+-    if (free_size < record_buffer_low_level_) {
+-      // When the free size in record buffer is below low level, cut the stack data in sample
+-      // records to 1K. This makes the unwinder unwind only part of the callchains, but hopefully
+-      // the call chain joiner can complete the callchains.
+-      stack_size_limit = 1024;
++
++    if (filter_by_tid_) {
++      bool thread_match = std::regex_search(name, thread_rx_);
++      if (thread_match) {
++        LOG(DEBUG) << "RUNT, ThrdMatch, " << name << " " << r.data->tid;
++        stack_allowed_tids_.insert(r.data->tid);
++      } else {
++        if (stack_allowed_tids_.erase(r.data->tid)) {
++          LOG(INFO) << "RUNT, ThrdMatchNoMore, " << name << " " << r.data->tid;
++        }
++      }     
+     }
+-    size_t stack_size_pos = record_parser_.GetStackSizePos(
+-        [&](size_t pos, size_t size, void* dest) {
+-          return kernel_record_reader->ReadRecord(pos, size, dest);
+-    });
+-    uint64_t stack_size;
+-    kernel_record_reader->ReadRecord(stack_size_pos, sizeof(stack_size), &stack_size);
+-    if (stack_size > 0) {
+-      size_t dyn_stack_size_pos = stack_size_pos + sizeof(stack_size) + stack_size;
+-      uint64_t dyn_stack_size;
+-      kernel_record_reader->ReadRecord(dyn_stack_size_pos, sizeof(dyn_stack_size), &dyn_stack_size);
+-      if (dyn_stack_size == 0) {
+-        // If stack_user_data.dyn_size == 0, it may be because the kernel misses the patch to
+-        // update dyn_size, like in N9 (See b/22612370). So assume all stack data is valid if
+-        // dyn_size == 0.
+-        // TODO: Add cts test.
+-        dyn_stack_size = stack_size;
++  } else if (header.type == PERF_RECORD_FORK) {
++    const ForkRecord& r = *static_cast<const ForkRecord*>(br.get());
++    // Until the comm/name is changed, if the parent pid is allowed, so is the forked.
++    if (filter_by_pid_ && (r.data->ppid != r.data->pid)) {
++      if (contains(stack_allowed_pids_, r.data->ppid)) {
++          stack_allowed_pids_.insert(r.data->pid);
+       }
+-      // When simpleperf requests the kernel to dump 64K stack per sample, it will allocate 64K
+-      // space in each sample to store stack data. However, a thread may use less stack than 64K.
+-      // So not all the 64K stack data in a sample is valid, and we only need to keep valid stack
+-      // data, whose size is dyn_stack_size.
+-      uint64_t new_stack_size = std::min<uint64_t>(dyn_stack_size, stack_size_limit);
+-      if (stack_size > new_stack_size) {
+-        // Remove part of the stack data.
+-        perf_event_header new_header = header;
+-        new_header.size -= stack_size - new_stack_size;
+-        char* p = record_buffer_.AllocWriteSpace(new_header.size);
+-        if (p != nullptr) {
+-          memcpy(p, &new_header, sizeof(new_header));
+-          size_t pos = sizeof(new_header);
+-          kernel_record_reader->ReadRecord(pos, stack_size_pos - pos, p + pos);
+-          memcpy(p + stack_size_pos, &new_stack_size, sizeof(uint64_t));
+-          pos = stack_size_pos + sizeof(uint64_t);
+-          kernel_record_reader->ReadRecord(pos, new_stack_size, p + pos);
+-          memcpy(p + pos + new_stack_size, &new_stack_size, sizeof(uint64_t));
+-          record_buffer_.FinishWrite();
+-          if (new_stack_size < dyn_stack_size) {
+-            cut_stack_samples_++;
+-          }
+-        } else {
+-          lost_samples_++;
+-        }
+-        return;
++    }
++
++    // Ditto for threads.
++    if (filter_by_tid_) {
++      if (contains(stack_allowed_tids_, r.data->ptid)) {
++          stack_allowed_tids_.insert(r.data->tid);
+       }
+     }
+   }
+-  char* p = record_buffer_.AllocWriteSpace(header.size);
+-  if (p != nullptr) {
+-    kernel_record_reader->ReadRecord(0, header.size, p);
+-    record_buffer_.FinishWrite();
++}
++
++char* RecordReadThread::AllocWriteSpace(uint64_t type, size_t record_size) {
++  char* p = record_buffer_.AllocWriteSpace(record_size);
++  if (p) {
++    current_period_stats_.events_copied += 1;
++    current_period_stats_.events_copied_bytes += record_size;
+   } else {
+-    if (header.type == PERF_RECORD_SAMPLE) {
++    if (type == PERF_RECORD_SAMPLE) {
+       lost_samples_++;
+     } else {
+       lost_non_samples_++;
+     }
+   }
++  return p;
++}
++
++bool RecordReadThread::PushOptimizedSample(KernelRecordReader* kernel_record_reader, const perf_event_header& header) {
++  if ((header.type != PERF_RECORD_SAMPLE) || !OptimizeStacks()) {
++    return false;
++  }
++
++  PerfSampleTidType tid_data = {};
++  if (record_parser_.GetTidPos()) {
++    kernel_record_reader->ReadRecord(record_parser_.GetTidPos(), sizeof(tid_data), &tid_data);
++  }
++
++  if (!tid_data.tid) {
++    return false;
++  }
++
++  bool stack_allowed = true;
++  if (filter_by_pid_ && !contains(stack_allowed_pids_, tid_data.pid)) {
++    stack_allowed = false;
++  } else if (filter_by_tid_ && !contains(stack_allowed_tids_, tid_data.tid)) {
++    stack_allowed = false;
++  }
++
++  auto read_fn = [&](size_t pos, size_t size, void* dest) {
++    return kernel_record_reader->ReadRecord(pos, size, dest);
++  };
++
++  if (!stack_allowed) {
++    // We will drop the event unless it is a cpu sample, in which case we will just drop its stack.
++    uint64_t sample_id = record_parser_.GetSampleId(read_fn);
++    if (!contains(cpu_sample_ids_, sample_id)) {
++      filtered_samples_ += 1;
++      return true;
++    }
++  }
++
++  RecordParser::RegsUser reg_data;
++  size_t stack_size_pos = record_parser_.GetStackSizePos(read_fn, &reg_data);
++  if (!stack_allowed) {
++    // Keep the sample but drop the stack. We are not bothering to strip callchain in kernel.
++    perf_event_header new_header = header;
++    new_header.size = stack_size_pos + 2 * sizeof(size_t);
++    char* p = AllocWriteSpace(header.type, new_header.size);
++    if (p != nullptr) {
++      removed_stack_samples_ += 1;
++      memcpy(p, &new_header, sizeof(new_header));
++      size_t pos = sizeof(new_header);
++      kernel_record_reader->ReadRecord(pos, stack_size_pos - pos, p + pos);
++      p += stack_size_pos;
++      // Copy zero stack size and the dynamic size: both zeroes.
++      uint64_t zero_stack_size = 0;
++      memcpy(p, &zero_stack_size, sizeof(zero_stack_size));
++      p += sizeof(zero_stack_size);
++      memcpy(p, &zero_stack_size, sizeof(zero_stack_size));
++      record_buffer_.FinishWrite();
++    }
++    return true;
++  }
++
++  uint64_t stack_size = 0;
++  kernel_record_reader->ReadRecord(stack_size_pos, sizeof(stack_size), &stack_size);
++  if (!stack_size) {
++    return false;
++  }
++
++  size_t dyn_stack_size_pos = stack_size_pos + sizeof(stack_size) + stack_size;
++  uint64_t dyn_stack_size;
++  kernel_record_reader->ReadRecord(dyn_stack_size_pos, sizeof(dyn_stack_size), &dyn_stack_size);
++  if (dyn_stack_size == 0) {
++    // Either the kernel is missing the dyn stack patch or a full stack was logged.
++    dyn_stack_size = stack_size;
++  }
++
++  RegSet regs(reg_data.regs.abi, reg_data.regs.reg_mask, reg_data.regs.regs);
++  uint64_t sp = 0;
++  regs.GetSpRegValue(&sp);
++  if (!sp) {
++    jk_assert(sp);
++    return false;
++  }
++
++  // Get a stack ref for the record.
++  auto stk = stack_cache_->get_stack(tid_data.tid, sp, dyn_stack_size,
++    [&](void* dest, size_t copy_offset, size_t copy_size) {
++      kernel_record_reader->ReadRecord(stack_size_pos + sizeof(stack_size) + copy_offset,
++                                      copy_size,
++                                      dest);
++    },
++    [&](size_t hash_offset, size_t hash_size) {
++      return kernel_record_reader->HashRecord(stack_size_pos + sizeof(stack_size) + hash_offset,
++                                      hash_size);
++    });
++
++  if (!stk) {
++    lost_samples_++;
++    return true;
++  }
++
++  current_period_stats_.optimized_events_ += 1;
++  current_period_stats_.optimized_events_bytes += header.size;
++
++  /* {
++    // Check that the stack is intact.
++    char buf1[64 * 1024];
++    copy_target t(buf1, sizeof(buf1));
++    stk->copy(t);
++    char buf2[64 * 1024];
++    kernel_record_reader->ReadRecord(stack_size_pos + sizeof(stack_size), dyn_stack_size, buf2);
++    jk_assert(memcmp(buf1, buf2, dyn_stack_size) == 0);
++  } */
++
++  // Copy the record and stack reference.
++  perf_event_header new_header = header;
++  new_header.type = PERF_RECORD_SAMPLE_WITH_STACK_REF;
++  new_header.size = stack_size_pos + sizeof(size_t);
++  char* p = AllocWriteSpace(header.type, new_header.size);
++  if (p != nullptr) {
++    memcpy(p, &new_header, sizeof(new_header));
++    size_t pos = sizeof(new_header);
++    kernel_record_reader->ReadRecord(pos, stack_size_pos - pos, p + pos);
++    stack_cache::stack_ref* ref = stk.get();
++    memcpy(p + stack_size_pos, &ref, sizeof(ref));
++    record_buffer_.FinishWrite();
++    // Release ownership of the stack reference, it will be queued to be really released
++    // when we are processing this record.      
++    stk.release();
++    stack_optimized_samples_ += 1;
++  }
++
++  return true;
++}
++
++void RecordReadThread::PushRecordToRecordBuffer(KernelRecordReader* kernel_record_reader) {
++  const perf_event_header& header = kernel_record_reader->RecordHeader();
++  nsecs_t now = systemTime();
++  if (now - current_period_stats_.time >= c_nsecs_in_sec) {
++    period_stats_.push_back(current_period_stats_);
++    current_period_stats_ = per_period_stats();
++    current_period_stats_.time = now;
++  }
++
++  current_period_stats_.raw_events_read += 1;
++  current_period_stats_.raw_events_read_bytes += header.size;
++
++  if (header.type == PERF_RECORD_LOST) {
++    char buffer[256];
++    kernel_record_reader->ReadRecord(0, std::min((unsigned int)header.size, sizeof(buffer)), buffer);
++    auto br = ReadRecordFromBuffer(attr_, buffer);
++    const LostRecord& r = *static_cast<const LostRecord*>(br.get());
++    kernel_dropped_samples_ += r.lost;
++    current_period_stats_.kernel_dropped_events_ += r.lost;
++  }
++
++  UpdateProcessThreadFilters(kernel_record_reader, header);
++
++  bool handled = PushOptimizedSample(kernel_record_reader, header);
++  if (handled) {
++    return;
++  }
++
++  char* p = AllocWriteSpace(header.type, header.size);
++  if (p != nullptr) {
++    kernel_record_reader->ReadRecord(0, header.size, p);
++    record_buffer_.FinishWrite();
++  }
+ }
+ 
+ bool RecordReadThread::SendDataNotificationToMainThread() {
+@@ -543,4 +892,5 @@ bool RecordReadThread::SendDataNotificationToMainThread() {
+   return true;
+ }
+ 
+-}  // namespace simpleperf
++
++}  // namespace simpleperf
+\ No newline at end of file
+diff --git a/simpleperf/RecordReadThread.h b/simpleperf/RecordReadThread.h
+index c4a6830a..576d8e9f 100644
+--- a/simpleperf/RecordReadThread.h
++++ b/simpleperf/RecordReadThread.h
+@@ -30,6 +30,8 @@
+ 
+ #include "event_fd.h"
+ #include "record.h"
++#include <regex>
++#include "stack_cache.h"
+ 
+ namespace simpleperf {
+ 
+@@ -69,14 +71,25 @@ class RecordParser {
+  public:
+   RecordParser(const perf_event_attr& attr);
+ 
++  struct RegsUser {
++    PerfSampleRegsUserType regs;
++    uint64_t data[64];
++  };
++
+   // Return pos of the time field in the record. If not available, return 0.
+   size_t GetTimePos(const perf_event_header& header) const;
+   // Return pos of the user stack size field in the sample record. If not available, return 0.
+-  size_t GetStackSizePos(const std::function<void(size_t,size_t,void*)>& read_record_fn) const;
++  size_t GetStackSizePos(const std::function<void(size_t,size_t,void*)>& read_record_fn,
++    RegsUser* reg_data = nullptr) const;
++  uint64_t GetSampleId(const std::function<void(size_t,size_t,void*)>& read_record_fn) const;
++  size_t GetTidPos() const { return tid_pos_in_sample_records_; }
+ 
+  private:
++  perf_event_attr attr_;
+   uint64_t sample_type_;
+   uint64_t sample_regs_count_;
++  size_t sample_id_pos_in_sample_records_ = 0;
++  size_t tid_pos_in_sample_records_ = 0;
+   size_t time_pos_in_sample_records_ = 0;
+   size_t time_rpos_in_non_sample_records_ = 0;
+   size_t callchain_pos_in_sample_records_ = 0;
+@@ -96,6 +109,8 @@ class KernelRecordReader {
+   uint64_t RecordTime() { return record_time_; }
+   // Read data of the current record.
+   void ReadRecord(size_t pos, size_t size, void* dest);
++  // Hash data of the current record.
++  uint32_t HashRecord(size_t pos, size_t size);
+   // Move to the next record, return false if there is no more records.
+   bool MoveToNextRecord(const RecordParser& parser);
+ 
+@@ -164,6 +179,9 @@ class RecordReadThread {
+   bool HandleRemoveEventFds(const std::vector<EventFd*>& event_fds);
+   bool ReadRecordsFromKernelBuffer();
+   void PushRecordToRecordBuffer(KernelRecordReader* kernel_record_reader);
++  void UpdateProcessThreadFilters(KernelRecordReader* kernel_record_reader, const perf_event_header& header);
++  bool PushOptimizedSample(KernelRecordReader* kernel_record_reader, const perf_event_header& header);
++  char* AllocWriteSpace(uint64_t type, size_t record_size);
+   bool SendDataNotificationToMainThread();
+ 
+   RecordBuffer record_buffer_;
+@@ -178,6 +196,10 @@ class RecordReadThread {
+   size_t min_mmap_pages_;
+   size_t max_mmap_pages_;
+ 
++  bool OptimizeStacks() const {
++    return (stack_size_in_sample_record_ > 1024);
++  }
++
+   // Used to pass command notification from the main thread to the read thread.
+   android::base::unique_fd write_cmd_fd_;
+   android::base::unique_fd read_cmd_fd_;
+@@ -194,10 +216,38 @@ class RecordReadThread {
+ 
+   std::unique_ptr<std::thread> read_thread_;
+   std::vector<KernelRecordReader> kernel_record_readers_;
++  std::unordered_map<uint64_t, std::string, integral_hasher<uint64_t>> event_name_map_;
++  std::unique_ptr<stack_cache> stack_cache_;
++  
++  std::unordered_set<uint64_t, integral_hasher<uint64_t>> cpu_sample_ids_;
++  bool filter_by_tid_ = false;
++  std::regex thread_rx_;
++  std::unordered_set<uint64_t, integral_hasher<uint64_t>> stack_allowed_tids_;
++  bool filter_by_pid_ = false;
++  std::regex process_rx_;
++  std::unordered_set<uint64_t, integral_hasher<uint64_t>> stack_allowed_pids_;
++
++  struct per_period_stats {
++    nsecs_t time = 0;
++    size_t raw_events_read = 0;
++    size_t raw_events_read_bytes = 0;
++    size_t events_copied = 0;
++    size_t events_copied_bytes = 0;
++    size_t optimized_events_ = 0;
++    size_t optimized_events_bytes = 0;
++    size_t kernel_dropped_events_ = 0;
++  };
++
++  per_period_stats current_period_stats_;
++  std::vector<per_period_stats> period_stats_;
+ 
++  size_t kernel_dropped_samples_ = 0;
+   size_t lost_samples_ = 0;
+   size_t lost_non_samples_ = 0;
+   size_t cut_stack_samples_ = 0;
++  size_t filtered_samples_ = 0;
++  size_t removed_stack_samples_ = 0;
++  size_t stack_optimized_samples_ = 0;
+ };
+ 
+ }  // namespace simpleperf
+diff --git a/simpleperf/cmd_record.cpp b/simpleperf/cmd_record.cpp
+index 6b45c3cd..bd665daa 100644
+--- a/simpleperf/cmd_record.cpp
++++ b/simpleperf/cmd_record.cpp
+@@ -58,6 +58,10 @@ using namespace simpleperf;
+ 
+ static std::string default_measured_event_type = "cpu-cycles";
+ 
++std::string g_thread_filter;
++std::string g_process_filter;
++bool g_fast_stacks = false;
++
+ static std::unordered_map<std::string, uint64_t> branch_sampling_type_map = {
+     {"u", PERF_SAMPLE_BRANCH_USER},
+     {"k", PERF_SAMPLE_BRANCH_KERNEL},
+@@ -139,6 +143,9 @@ class RecordCommand : public Command {
+ "                 Similar to \"-c 1 -e sched:sched_switch\".\n"
+ "\n"
+ "Select monitoring options:\n"
++"--stk-fast   Enable reusing stack blocks for thread if they seem to match\n"
++"--filter-thread rx Set thread name rx for filtering threads\n"
++"--filter-process rx Set process name rx for filtering processes\n"
+ "-f freq      Set event sample frequency. It means recording at most [freq]\n"
+ "             samples every second. For non-tracepoint events, the default\n"
+ "             option is -f 4000. A -f/-c option affects all event types\n"
+@@ -274,6 +281,7 @@ class RecordCommand : public Command {
+   bool DumpUserSpaceMaps();
+   bool DumpProcessMaps(pid_t pid, const std::unordered_set<pid_t>& tids);
+   bool ProcessRecord(Record* record);
++  bool ProcessRecordWorker(Record* record);
+   bool ShouldOmitRecord(Record* record);
+   bool DumpMapsForRecord(Record* record);
+   bool SaveRecordForPostUnwinding(Record* record);
+@@ -629,9 +637,9 @@ bool RecordCommand::PostProcessRecording(const std::vector<std::string>& args) {
+   }
+   lost_record_count_ += lost_samples + lost_non_samples;
+   LOG(INFO) << "Samples recorded: " << sample_record_count_ << cut_samples
+-            << ". Samples lost: " << lost_record_count_ << ".";
+-  LOG(DEBUG) << "In user space, dropped " << lost_samples << " samples, " << lost_non_samples
+-             << " non samples, cut stack of " << cut_stack_samples << " samples.";
++            << ". Samples lost: " << lost_record_count_
++            << ". In user space, dropped " << lost_samples << " samples, " << lost_non_samples
++            << " non samples.";
+   if (sample_record_count_ + lost_record_count_ != 0) {
+     double lost_percent = static_cast<double>(lost_record_count_) /
+                           (lost_record_count_ + sample_record_count_);
+@@ -657,6 +665,10 @@ bool RecordCommand::PostProcessRecording(const std::vector<std::string>& args) {
+   return true;
+ }
+ 
++#include <cstdlib>
++#include <sys/resource.h>
++#include "stack_cache.h"
++
+ bool RecordCommand::ParseOptions(const std::vector<std::string>& args,
+                                  std::vector<std::string>* non_option_args) {
+   std::vector<size_t> wait_setting_speed_event_groups_;
+@@ -664,6 +676,78 @@ bool RecordCommand::ParseOptions(const std::vector<std::string>& args,
+   for (i = 0; i < args.size() && !args[i].empty() && args[i][0] == '-'; ++i) {
+     if (args[i] == "-a") {
+       system_wide_collection_ = true;
++    } else if (args[i] == "--spt") {
++      uint32_t picked_test = 0;
++      if (!GetUintOption(args, &i, &picked_test, 1, 100)) {
++        return false;
++      }
++
++      rlimit rlim;
++      int result = getrlimit(RLIMIT_NICE, &rlim);
++      if (result == 0 && rlim.rlim_cur == 40) {
++        result = setpriority(PRIO_PROCESS, gettid(), -20);
++        jk_assert(result == 0);
++      }
++
++      stack_cache cache(32 * 1024 * 1024);
++      char buf[64 * 1024];
++      char buf2[sizeof(buf)];
++      for (int i = 0; i < sizeof(buf); i++) {
++        buf[i] = (char)rand();
++      }
++      // Get some zero pages too for testing.
++      memset(buf+4096, 0, 4096);
++      nsecs_t start = systemTime();
++      size_t count = 0;
++      for(;;) {
++          for (int i = 0; i < 100; i++) {
++            count++;
++            if ((picked_test == 1) || (picked_test == 2)) {
++              if (picked_test == 2) {
++                cache.set_allow_thread_stack_reuse(false);
++              }
++              auto ref = cache.get_stack(1000, 0x1000000, sizeof(buf), 
++                [&](void* dest, size_t copy_offset, size_t copy_size){
++                  memcpy(dest, buf + copy_offset, copy_size);
++                },
++                [&](size_t hash_offset, size_t hash_size){
++                  return stk_hash(buf + hash_offset, hash_size);
++                });
++              ref.reset(nullptr);
++            }
++            if (picked_test == 3) {
++              volatile uint32_t hash = 0;
++              buf[2] = (char)hash;
++              memcpy(buf2, buf, sizeof(buf));
++              hash += buf2[4343];
++              hash += stk_hash(buf2, sizeof(buf2));
++            }
++            if (picked_test == 4) {
++              volatile uint32_t hash = 0;
++              hash += stk_hash(buf, sizeof(buf));
++            }
++            if (picked_test == 5) {
++              volatile uint32_t hash = 0;
++              hash += mult_hash(buf, sizeof(buf));
++            }
++            if (picked_test == 6) {
++              volatile uint32_t hash = 0;
++              hash += fnv1a_hash(buf, sizeof(buf));
++            }
++          }
++
++          nsecs_t now = systemTime();
++          nsecs_t delta = now - start;
++          if (delta > 300000000LL) {
++            stack_cache::stack_stats stats;
++            cache.get_stats(stats);
++            fprintf(stderr, "%f/s %fus %u %u %u %u %u %u\n", ((double)count) / nsecToS(delta), (((double)delta)/count)/1000.0f,
++              stats.hit_blocks, stats.zero_blocks, stats.missed_blocks, stats.partial_blocks,
++              stats.reused_thread_blocks, stats.mismatch_thread_blocks);
++            count = 0;
++            start = now;
++          }
++      }
+     } else if (args[i] == "--app") {
+       if (!NextArgumentOrError(args, &i)) {
+         return false;
+@@ -691,6 +775,18 @@ bool RecordCommand::ParseOptions(const std::vector<std::string>& args,
+       }
+       wait_setting_speed_event_groups_.clear();
+ 
++    } else if (args[i] == "--filter-thread") {
++      if (!NextArgumentOrError(args, &i)) {
++        return false;
++      }
++      g_thread_filter = args[i];
++    } else if (args[i] == "--filter-process") {
++      if (!NextArgumentOrError(args, &i)) {
++        return false;
++      }
++      g_process_filter = args[i];
++    } else if (args[i] == "--stk-fast") {
++      g_fast_stacks = true;
+     } else if (args[i] == "--call-graph") {
+       if (!NextArgumentOrError(args, &i)) {
+         return false;
+@@ -1172,6 +1268,16 @@ bool RecordCommand::DumpProcessMaps(pid_t pid, const std::unordered_set<pid_t>&
+ }
+ 
+ bool RecordCommand::ProcessRecord(Record* record) {
++    nsecs_t start = systemTime();
++    bool ret = ProcessRecordWorker(record);
++    nsecs_t dur = systemTime() - start;
++    if (dur > 10 * 1000 * 1000) {
++      LOG(DEBUG) << "ProcessRecord took " << nsecToS(dur) << " at " << nsecToS(systemTime()) << ": ";
++    }
++    return ret;
++}
++
++bool RecordCommand::ProcessRecordWorker(Record* record) {
+   UpdateRecord(record);
+   if (ShouldOmitRecord(record)) {
+     return true;
+diff --git a/simpleperf/event_fd.h b/simpleperf/event_fd.h
+index e4e20ce4..1423c171 100644
+--- a/simpleperf/event_fd.h
++++ b/simpleperf/event_fd.h
+@@ -48,6 +48,8 @@ class EventFd {
+   // Give information about this perf_event_file, like (event_name, tid, cpu).
+   std::string Name() const;
+ 
++  std::string EventName() const { return event_name_; }
++
+   uint64_t Id() const;
+ 
+   pid_t ThreadId() const { return tid_; }
+diff --git a/simpleperf/stack_cache.h b/simpleperf/stack_cache.h
+new file mode 100644
+index 00000000..84b2a3e6
+--- /dev/null
++++ b/simpleperf/stack_cache.h
+@@ -0,0 +1,892 @@
++#ifndef SIMPLE_PERF_STACK_CACHE_H_
++#define SIMPLE_PERF_STACK_CACHE_H_
++
++#include <thread>
++#include <mutex>
++#include <vector>
++#include <list>
++#include <unordered_map>
++#include <algorithm>
++
++#include <sys/types.h>
++#include <time.h>
++
++typedef int64_t nsecs_t;
++const nsecs_t c_nsecs_in_sec = 1000000000LL;
++inline nsecs_t systemTime()
++{
++    struct timespec t;
++    t.tv_sec = t.tv_nsec = 0;
++    clock_gettime(CLOCK_MONOTONIC, &t);
++    return (nsecs_t(t.tv_sec)*c_nsecs_in_sec) + t.tv_nsec;
++}
++
++inline float nsecToS(nsecs_t time)
++{
++  return ((double)time) / 1000000000.0f;
++}
++
++#include <cstddef>
++#include <cstdio>
++#define jk_assert(x) \
++    if (!(x)) { fprintf(stderr, "ASSERT: %s [%s:%d]", #x, __FILE__, __LINE__); abort(); }
++
++#include <cstdarg>
++#include <sstream>
++inline std::stringstream& append_format(std::stringstream& ss, const char* format, ...) {
++  va_list args;
++  va_start (args, format);
++  char buffer[1024];
++  vsnprintf (buffer, sizeof(buffer), format, args);
++  buffer[sizeof(buffer) - 1] = 0;
++  ss << buffer;
++  va_end (args);
++  return ss;
++}
++
++const uint32_t c_FNV1a_Prime = 0x01000193; //   16777619
++const uint32_t c_FNV1a_Seed  = 0x811C9DC5; // 2166136261
++inline uint32_t fnv1a_hash(const void* data, size_t numBytes, uint32_t hash = c_FNV1a_Seed) {
++  const unsigned char* ptr = (const unsigned char*)data;
++  while (numBytes--)
++    hash = (*ptr++ ^ hash) * c_FNV1a_Prime;
++  return hash;
++}
++
++template<typename T>
++struct fnv1a_hasher {
++  std::size_t operator()(const T& k) const {
++    return fnv1a_hash(&k, sizeof(k));
++  }
++};
++
++const uint32_t c_MultHash_Seed = 5381;
++inline uint32_t mult_hash(const void* data, size_t numBytes, uint32_t hash = c_MultHash_Seed) {
++  const unsigned char* ptr = (const unsigned char*)data;
++  while (numBytes--) {
++    hash = (33 * hash) + *ptr++;
++  }
++  return hash;
++}
++
++template<typename T>
++struct mult_hasher {
++  std::size_t operator()(const T& k) const {
++    return mult_hash(&k, sizeof(k));
++  }
++};
++
++#define stk_hash mult_hash
++
++template<typename T>
++struct integral_hasher {
++  std::size_t operator()(const T& k) const {
++    return ((uint32_t)k) * 2654435761;
++  }
++};
++
++template <typename T, std::size_t N>
++constexpr std::size_t countof(T const (&)[N]) noexcept {
++    return N;
++}
++
++template <typename T>
++constexpr T align_up(T x, size_t a) noexcept {
++  return T((x + (T(a) - 1)) & ~T(a-1));
++}
++
++template <typename P1, typename P2>
++size_t ptr_diff_bytes(P1 p1, P2 p2) {
++    char* p1c = (char*)p1;
++    char* p2c = (char*)p2;
++    jk_assert(p1c >= p2c);
++    return p1c - p2c;
++}
++
++template <typename P>
++P ptr_add_bytes(P p, size_t size) {
++    return (P)(((char*)p) + size);
++}
++
++template <typename P>
++P ptr_sub_bytes(P p, size_t size) {
++    return (P)(((char*)p) - size);
++}
++
++template <typename T, typename K>
++bool contains(const T& container, const K& key) {
++    return (container.find(key) != container.end());
++}
++
++template <typename T, typename K, typename V>
++bool find_entry(T& container, const K& key, V** ptr_out) {
++    auto it = container.find(key);
++    if (it != container.end()) {
++        *ptr_out = &it->second;
++        return true;
++    }
++    *ptr_out = nullptr;
++    return false;
++}
++
++template <typename T>
++class link_node {
++ public:
++  link_node() : prev_(nullptr), next_(nullptr) {}
++  link_node(link_node* p, link_node* n) : prev_(p), next_(n) {}
++  link_node(const link_node&) = delete;
++  link_node& operator= (const link_node&) = delete;
++  link_node(link_node&& other) { *this = std::move(other); }
++  link_node& operator=(link_node&& other) {
++    if (this != &other) {
++      next_ = other.next_;
++      other.next_ = nullptr;
++      prev_ = other.prev_;
++      other.prev_ = nullptr;
++      if (next_) {
++        next_->prev_ = this;
++        prev_->next_ = this;
++      }
++    }
++    return *this;
++  }
++
++  void insert_before(link_node<T>* e) {
++    this->next_ = e;
++    this->prev_ = e->prev_;
++    e->prev_->next_ = this;
++    e->prev_ = this;
++  }
++
++  void insert_after(link_node<T>* e) {
++    this->next_ = e->next_;
++    this->prev_ = e;
++    e->next_->prev_ = this;
++    e->next_ = this;
++  }
++
++  void remove() {
++    this->prev_->next_ = this->next_;
++    this->next_->prev_ = this->prev_;
++    this->next_ = nullptr;
++    this->prev_ = nullptr;
++  }
++
++  link_node<T>* prev() const {
++    return prev_;
++  }
++
++  link_node<T>* next() const {
++    return next_;
++  }
++
++  const T* get() const {
++    return static_cast<const T*>(this);
++  }
++
++  T* get() {
++    return static_cast<T*>(this);
++  }
++
++  bool in_list() {
++      jk_assert((next_ && prev_) || (!next_ && !prev_));
++      return (next_ != nullptr);
++  }
++
++ private:
++  link_node<T>* prev_;
++  link_node<T>* next_;
++};
++
++template <typename T>
++class linked_list {
++ public:
++  linked_list() : root_(&root_, &root_) {}
++  linked_list(const linked_list&) = delete;
++  linked_list& operator= (const linked_list&) = delete;
++
++  void push_back(link_node<T>* e) {
++    jk_assert(!e->in_list());
++    e->insert_before(&root_);
++  }
++
++  link_node<T>* pop_back() {
++    if (empty()) {
++        return nullptr;
++    }
++
++    link_node<T>* e = back();
++    e->remove();
++    return e;
++  }
++
++  void push_front(link_node<T>* e) {
++    jk_assert(!e->in_list());
++    e->insert_after(&root_);
++  }
++
++  link_node<T>* pop_front() {
++    if (empty()) {
++        return nullptr;
++    }
++
++    link_node<T>* e = front();
++    e->remove();
++    return e;
++  }
++
++  link_node<T>* front() const {
++    return root_.next();
++  }
++
++  link_node<T>* back() const {
++    return root_.prev();
++  }
++
++  const link_node<T>* end() const {
++    return &root_;
++  }
++
++  bool empty() const { return front() == end(); }
++
++  void move_to(linked_list& other) {
++    if (!empty()) {
++      jk_assert(other.empty());
++      other.root_ = std::move(root_);
++      // Reinit our list, after node move our next/prev is nullptr...
++      jk_assert(!root_.in_list());
++      link_node<T> empty_root(&root_, &root_);
++      root_ = std::move(empty_root);
++      jk_assert(empty());
++    }
++  }
++
++ private:
++  link_node<T> root_;
++};
++
++template<typename T>
++class smart_ref {
++public:
++  smart_ref() {}
++  smart_ref(T *p) : p_(p) {}
++  smart_ref(const smart_ref&) = delete;
++  smart_ref& operator= (const smart_ref&) = delete;
++  smart_ref(smart_ref&& other) { *this = std::move(other); }
++  smart_ref& operator=(smart_ref&& other) {
++    if (this != &other) {
++      release();
++      p_ = other.p_;
++      other.p_ = nullptr;
++    }
++    return *this;
++  }
++
++  ~smart_ref() {
++    release();
++  }
++
++  void reset(T *p) {
++    release();
++    p_ = p;
++  }
++
++  void release() {
++    if (p_) {
++      p_->release();
++      p_ = nullptr;
++    }
++  }
++
++  T* get() {
++    return p_;
++  }
++
++  const T* get() const {
++    return p_;
++  }
++
++  operator bool() const {
++    return p_ != 0;
++  }
++
++private:
++  T* p_ = nullptr;
++};
++
++template <typename T>
++T* advance_ptr(T* p, size_t a) {
++    return reinterpret_cast<T*>(reinterpret_cast<uintptr_t>(p) + a);
++}
++
++struct copy_source {
++  const void* source = nullptr;
++  size_t remaining = 0;
++  
++  copy_source(const void* p, size_t size) : source(p), remaining(size) {
++  }
++
++  void advance(size_t size) {
++      if (size > remaining) {
++        jk_assert(size <= remaining);
++        size = remaining;
++      }
++
++      source = advance_ptr(source, size);
++      remaining -= size;
++  }
++};
++
++struct copy_target {
++  void* target = nullptr;
++  size_t remaining = 0;
++
++  copy_target(void* p, size_t size) : target(p), remaining(size) {
++  }
++
++  bool copy(const void* src, size_t size) {
++      bool success = true;
++      if (size > remaining) {
++        jk_assert(size <= remaining);
++        size = remaining;
++        success = false;
++      }
++      
++      memcpy(target, src, size);
++      advance(size);
++      return success;
++  }
++
++  void advance(size_t size) {
++      if (size > remaining) {
++        jk_assert(size <= remaining);
++        size = remaining;
++      }
++
++      target = advance_ptr(target, size);
++      remaining -= size;
++  }
++};
++
++struct block_sig {
++    uint64_t samples[8] = {};
++    uint32_t hash = 0;
++
++    bool operator==(const block_sig& rhs) const {
++        return (hash == rhs.hash) && 
++            (0 == memcmp(samples, rhs.samples, sizeof(samples)));
++    }
++};
++
++class block_cache {
++public:
++  static const size_t c_block_size = 2048;
++  const size_t c_preallocate_size = 64 * 1024 * 1024;
++
++  block_cache(size_t size_max) :
++    size_max_(size_max) {
++    cache_thread_id_ = std::this_thread::get_id();
++
++    // Preallocate blocks and put them on the free list.
++    size_t remaining = std::min(size_max, c_preallocate_size);
++    while (remaining >= c_block_size) {
++      add_block_to_free_list();
++      remaining -= c_block_size;
++    }
++  }
++
++  struct block_stats {
++    size_t max_size_active;
++    size_t max_blocks_cached;
++    size_t repurposed_blocks;
++  };
++
++  void get_stats(block_stats& stats) {
++    stats = stats_;
++  }
++
++  // Hash collision is unlikely, but may happen. We reduce the likelihood by using the
++  // thread id and stack pointer as part of the keys. We special case the all zeros block.
++  struct block_key {
++    uint64_t sp = 0;
++    uint32_t hash = 0;
++    int tid = 0;
++
++    bool zero_block() const {
++      if (!sp && !hash && !tid) {
++        return true;
++      }
++      return false;
++    }
++
++    void set_to_zero_block_key() {
++      sp = 0;
++      hash = 0;
++      tid = 0;
++    }
++
++    bool operator==(const block_key &other) const {
++        return (sp == other.sp) && (hash == other.hash) && (tid == other.tid);
++    }    
++  };
++
++  class block : public link_node<block> {
++    friend class block_cache;
++    friend class smart_ref<block>;
++  public:
++
++    void copy(copy_target& target) {
++      size_t copy_size = std::min(target.remaining, data_.size());
++      if (key_.zero_block()) {
++        memset(target.target, 0, copy_size);
++      } else {
++        memcpy(target.target, data_.data(), copy_size);
++      }
++      target.advance(copy_size);
++    }
++
++    bool zero_block() const {
++        return key_.zero_block();
++    }
++
++    size_t size() const {
++        return data_.size();
++    }
++
++    void* data() {
++        return data_.data();
++    }
++
++    void set_valid() {
++        jk_assert(!dataValid_);
++        jk_assert(!zero_block());
++        dataValid_ = true;
++    }
++
++    bool valid() {
++        return dataValid_;
++    }
++
++    void clear() {
++        jk_assert(!refcount_);
++        dataValid_ = false;
++        data_.resize(0);
++        key_ = block_key();
++    }
++
++  private:
++    void release() { cache_->release_block(this); }
++    void set_data(std::vector<char>&& data) { data_ = std::move(data); }
++
++  private:
++    block_cache* cache_ = nullptr;
++    int refcount_ = 0;
++    bool dataValid_ = false;
++    block_key key_;
++    std::vector<char> data_;
++  };
++
++  typedef smart_ref<block> block_ref;
++
++  block_ref reference_block(block* blk) {
++      // If first reference, block should be on LRU so remove it.
++      blk->refcount_ += 1;
++      jk_assert(blk->refcount_ > 0);
++      if (blk->refcount_ == 1) {
++        // Block should be on LRU, remove it.
++        jk_assert(blk->in_list());
++        blk->remove();
++      }
++      return block_ref(blk);
++  }
++
++  void release_block(block* blk) {
++      jk_assert(on_cache_thread());
++      jk_assert(blk->refcount_ > 0);
++      jk_assert(blk->data_.capacity() == c_block_size);
++      blk->refcount_ -= 1;
++      if (blk->refcount_ == 0) {
++        jk_assert(!blk->in_list());
++        lru_.push_back(blk);
++      }
++  }
++
++  block_ref get_block(const block_key& key, size_t request_size) {
++      jk_assert(request_size <= c_block_size);
++
++      // First check for existing.
++      jk_assert(on_cache_thread());
++      auto found = map_.find(key);
++      if (found != map_.end()) {
++          auto* blk = found->second;
++          return reference_block(blk);
++      }
++
++      // Do we have room? Repurpose from LRU until we do.
++      while ((size_ + request_size > size_max_) && (!lru_.empty())) {
++        stats_.repurposed_blocks += 1;
++        auto* node = lru_.pop_front();
++        auto* blk = node->get();
++        jk_assert(!blk->refcount_);
++        jk_assert(size_ > blk->data_.size());
++        size_ -= blk->data_.size();
++        map_.erase(blk->key_);
++        blk->clear();
++        free_list_.push_back(blk);
++      }
++
++      if (size_ + request_size > size_max_) {
++        return block_ref(nullptr);
++      }
++
++      // If we don't have any blocks on the prepopulated free list, allocate.
++      if (free_list_.empty()) {
++          add_block_to_free_list();
++      }
++
++      // Pop a new block from the free list.
++      jk_assert(!free_list_.empty());
++      block* blk = free_list_.pop_back()->get();
++      jk_assert(!blk->valid());
++      blk->refcount_ = 1;
++      blk->key_ = key;
++      blk->cache_ = this;      
++      blk->data_.resize(request_size);
++      jk_assert(blk->data_.capacity() == c_block_size);
++      size_ += request_size;
++      if (stats_.max_size_active < size_) {
++        stats_.max_size_active = size_;
++      }
++      auto inserted = map_.insert(std::make_pair(key, blk));
++      jk_assert(inserted.second);
++      if (stats_.max_blocks_cached < map_.size()) {
++        stats_.max_blocks_cached = map_.size();
++      }
++      return block_ref(blk);
++  }
++
++  bool on_cache_thread() {
++    return (cache_thread_id_ == std::this_thread::get_id());
++  }
++
++private:
++  void add_block_to_free_list() {
++    blocks_.push_back(block());
++    auto& block = blocks_.back();
++    block.data_.reserve(c_block_size);
++    free_list_.push_back(&block);
++  }
++
++private:
++  size_t size_max_;
++  size_t size_;
++  std::list<block> blocks_;
++  std::unordered_map<block_key, block*, mult_hasher<block_key>> map_;
++  // Head of the list is the least recently used. New entries pushed to tail.
++  linked_list<block> lru_;
++  linked_list<block> free_list_;
++  std::thread::id cache_thread_id_;
++  block_stats stats_ = {};
++};
++
++class stack_cache {
++public:
++  stack_cache(size_t size_max) :
++    blocks_(size_max) {
++    cache_thread_id_ = std::this_thread::get_id();
++    char buffer[block_cache::c_block_size] = {0};
++    zero_block_hash_ = stk_hash(buffer, sizeof(buffer)); 
++  }
++
++  ~stack_cache() {
++    flush_released_refs();
++    jk_assert(released_refs_.empty());
++    jk_assert(!outstanding_refs_);
++  }
++
++  struct stack_stats {
++    size_t stacks;
++    size_t stacks_dropped;
++    size_t zero_blocks;
++    size_t hit_blocks;
++    size_t missed_blocks;
++    size_t partial_blocks;
++    size_t reused_thread_blocks;
++    size_t mismatch_thread_blocks;
++    size_t bad_reused_thread_blocks;
++  };
++
++  void set_allow_thread_stack_reuse(bool value) {
++      allow_thread_stack_reuse_ = value;
++  }
++ 
++  void get_stats (stack_stats& stats) {
++    stats = stats_;
++  }
++
++  void get_block_stats (block_cache::block_stats& stats) {
++    blocks_.get_stats(stats);
++  }
++
++  class stack_ref : public link_node<stack_ref> {
++    friend class stack_cache;
++  public:
++    stack_ref(stack_cache* cache) : cache_(cache) {
++    }
++
++    ~stack_ref() {
++      cache_->on_stack_ref_delete();
++    }
++
++    // On other threads only queue_release is safe!
++    // Destruction/deletion is not due to simplified locking.
++    void queue_release() {
++      cache_->queue_release(this);
++    }
++
++    void copy(copy_target& target) {
++      jk_assert(target.remaining >= size_);
++      const void *base = target.target;
++      for (auto& ref : blocks_) {
++        ref.get()->copy(target);
++        if (!target.remaining) {
++            break;
++        }
++      }
++      jk_assert(ptr_diff_bytes(target.target, base) == size_);
++    }
++
++    size_t size() {
++        return size_;
++    }
++
++    stack_cache* cache() {
++        return cache_;
++    }
++
++  private:
++    stack_cache* cache_ = nullptr;
++    std::vector<block_cache::block_ref> blocks_;
++    size_t size_ = 0;
++  };
++
++  bool on_cache_thread() {
++    return (cache_thread_id_ == std::this_thread::get_id());
++  }
++
++  void queue_release(stack_ref* stk) {
++    {
++      std::lock_guard<std::mutex> lock(lock_);
++      jk_assert(!stk->in_list());
++      released_refs_.push_back(stk);
++      released_refs_size_ += 1;
++    }
++  }
++
++  void on_stack_ref_delete() {
++      jk_assert(on_cache_thread());
++      jk_assert(outstanding_refs_);
++      outstanding_refs_ -= 1;
++  }
++
++  std::unique_ptr<stack_ref> get_stack(int tid, uint64_t sp, size_t size,
++    const std::function<void(void*,size_t,size_t)>& read_fn,
++    const std::function<uint32_t(size_t,size_t)>& hash_fn) {
++
++    stats_.stacks += 1;
++
++    // Every so often flush the released stacks from the processing thread. Reduce the frequency
++    // to prevent lock contention.
++    if (released_refs_size_ > 32) {
++      flush_released_refs();
++    }
++
++    jk_assert(on_cache_thread());
++    std::unique_ptr<stack_ref> ref(new stack_ref(this));
++    outstanding_refs_ += 1;
++
++    // Get the blocks and add to the ref.
++    size_t remaining = size;
++    uint64_t chunk_base = sp;
++    block_cache::block_key key;
++    auto& thread_hashes = thread_stack_hashes_[tid];
++    bool reuse_thread_blocks = false;
++    while (remaining) {
++      uint64_t chunk_end = align_up(chunk_base + 1, block_cache::c_block_size);
++      size_t chunk_size = (size_t)(chunk_end - chunk_base);
++      chunk_size = std::min(chunk_size, remaining);
++      key.tid = tid;
++      bool read_data = true;
++      size_t chunk_read_offset = ptr_diff_bytes(chunk_base, sp);
++      uint32_t chunk_hash = 0;
++      bool reusing_chunk_hash = false;
++      if (chunk_size == block_cache::c_block_size) {
++        const block_sig* cached_sig = nullptr;
++        find_entry(thread_hashes, chunk_base, &cached_sig);
++        key.sp = chunk_base;
++        bool got_hash = false;
++        if (reuse_thread_blocks && cached_sig) {
++            // Check the front and end parts of this block for a bit more safety.
++            block_sig chunk_sig;
++            chunk_sig.hash = cached_sig->hash;
++            for (int sample = 0; sample < countof(chunk_sig.samples); sample++) {
++                size_t sample_offset = chunk_read_offset + (sample * chunk_size / countof(chunk_sig.samples));
++                read_fn(&chunk_sig.samples[sample], sample_offset, sizeof(chunk_sig.samples[sample]));
++            }
++            if (*cached_sig == chunk_sig) {
++                chunk_hash = cached_sig->hash;
++                reusing_chunk_hash = true;
++                got_hash = true;
++                stats_.reused_thread_blocks += 1;
++                // Enable to validate that the hash would have matched...
++                /* uint32_t real_hash = hash_fn(chunk_read_offset, chunk_size);
++                if (chunk_hash != real_hash) {
++                    chunk_hash = real_hash;
++                    stats_.bad_reused_thread_blocks += 1;
++                } */
++            } else {
++                // Cannot assume the following blocks are same either now
++                // to be on the safe side...
++                reuse_thread_blocks = false;
++                stats_.mismatch_thread_blocks += 1;
++            }
++        }
++
++        if (!got_hash) {
++            chunk_hash = hash_fn(chunk_read_offset, chunk_size);
++            got_hash = true;
++            // Does this block's hash match what we had before?
++            if (cached_sig) {
++                if (cached_sig->hash == chunk_hash) {
++                    // Go on a limb and assume the rest of full blocks will also match...
++                    // This is risky if a routine pushes large buffers on the stack and it
++                    // looks like large parts of the stack have not changed, but we may
++                    // have changes in parts we do not check etc.
++                    // Note that since we just did a full hash, we are not rechecking front
++                    // and end parts for a match.
++                    reuse_thread_blocks = true;
++                }
++            }
++        }
++
++        jk_assert(got_hash);
++        key.hash = chunk_hash;
++        if (key.hash == zero_block_hash_) {
++          // We could do an extra validation that buffer is all zeros in case of a cache collision
++          // but we will opt to be faster given their frequency and likelihood...
++          key.set_to_zero_block_key();
++          read_data = false;
++        }
++      } else {
++        // Incomplete block - we don't expect to be able to reuse these, don't bother hashing.
++        // Generate a unique enough key, it may wrap but unlikely given our tracing limits.
++        custom_part_id_ += 1;
++        key.sp = custom_part_id_ + 1;
++        key.hash = custom_part_id_ + 2;
++      }
++
++      block_cache::block_ref blkref;
++      blkref = blocks_.get_block(key, chunk_size);
++      if (!blkref) {
++        // Flush the release refs and try again...
++        if (released_refs_size_) {
++          flush_released_refs();
++          blkref = blocks_.get_block(key, chunk_size);
++        }
++
++        if (!blkref) {
++          stats_.stacks_dropped += 1;
++          return nullptr;
++        }
++      }
++
++      auto* blk = blkref.get();
++      if (blk->zero_block()) {
++        stats_.zero_blocks += 1;
++      } else if (blk->valid()) {
++        stats_.hit_blocks += 1;
++      } else {
++        if (chunk_size < block_cache::c_block_size) {
++          stats_.partial_blocks += 1;
++        } else {
++          stats_.missed_blocks += 1;
++        }
++      }
++
++      // Save the actual contents only if we need to, e.g. no need if we hit the cache.
++      jk_assert(blk->size() == chunk_size);
++      if (read_data && !blk->valid()) {
++        jk_assert(!blk->zero_block());
++        read_fn(blk->data(), chunk_read_offset, chunk_size);
++        blk->set_valid();
++      }
++
++      // Save the last hash we saw for this thread at this stack position.
++      if (allow_thread_stack_reuse_ &&
++          !reusing_chunk_hash &&
++          (chunk_size == block_cache::c_block_size)) {
++          block_sig sig;
++          sig.hash = chunk_hash;
++          if (!blk->zero_block()) {
++            for (int sample = 0; sample < countof(sig.samples); sample++) {
++              void* sample_ptr = ptr_add_bytes(blk->data(), (sample * chunk_size / countof(sig.samples)));
++              memcpy(&sig.samples[sample], sample_ptr, sizeof(sig.samples[sample]));
++            }
++          }
++          thread_hashes[chunk_base] = sig;
++      }
++
++      // Cached zero block must be for the full size.
++      jk_assert(!key.zero_block() ||
++                (blk->zero_block() && (blk->size() == block_cache::c_block_size)));
++
++      ref->blocks_.push_back(std::move(blkref));
++      ref->size_ += chunk_size;
++      jk_assert(remaining >= chunk_size);
++      remaining -= chunk_size;
++      chunk_base += chunk_size;
++    }
++
++    jk_assert(ref->size_ == size);
++    return ref;
++  }
++
++private:
++  void flush_released_refs() {
++    jk_assert(on_cache_thread());
++    linked_list<stack_ref> to_release;
++    size_t to_release_size = 0;
++    {
++      std::lock_guard<std::mutex> lock(lock_);
++      released_refs_.move_to(to_release);
++      to_release_size = released_refs_size_;
++      released_refs_size_ = 0;
++    }
++
++    while (!to_release.empty()) {
++      auto* stk = to_release.pop_back()->get();
++      jk_assert(to_release_size);
++      to_release_size -= 1;
++      delete stk;
++    }
++
++    jk_assert(to_release_size == 0);
++  }
++
++private:
++  block_cache blocks_;
++  linked_list<stack_ref> released_refs_;
++  size_t released_refs_size_ = 0; 
++  size_t outstanding_refs_ = 0;
++  std::mutex lock_;
++  std::thread::id cache_thread_id_;
++  size_t custom_part_id_ = 1;
++  uint32_t zero_block_hash_ = 0;
++  stack_stats stats_ = {};
++  bool allow_thread_stack_reuse_ = true;
++  std::unordered_map<int,
++    std::unordered_map<uint64_t, block_sig, integral_hasher<uint64_t>>,
++        integral_hasher<uint64_t>> thread_stack_hashes_;
++};
++
++#endif // #ifndef SIMPLE_PERF_STACK_CACHE_H_
+-- 
+2.13.5
+

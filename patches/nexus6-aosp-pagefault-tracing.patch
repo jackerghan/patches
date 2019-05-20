@@ -1,0 +1,237 @@
+From 21e7209ada9f80364eb69836bdb950c248032124 Mon Sep 17 00:00:00 2001
+From: JackE <jacke@fb.com>
+Date: Fri, 17 May 2019 13:10:55 -0700
+Subject: [PATCH 1/3] Pagefault tracing and emptying support
+
+---
+ shamu/arch/arm/mm/fault.c              | 43 ++++++++++++++++--
+ shamu/fs/drop_caches.c                 | 62 +++++++++++++++++++++++---
+ shamu/include/trace/events/exception.h | 41 +++++++++++++++++
+ shamu/mm/memory.c                      |  2 +-
+ 4 files changed, 139 insertions(+), 9 deletions(-)
+
+diff --git a/shamu/arch/arm/mm/fault.c b/shamu/arch/arm/mm/fault.c
+index 359d44a24..d8a9d7ca5 100644
+--- a/shamu/arch/arm/mm/fault.c
++++ b/shamu/arch/arm/mm/fault.c
+@@ -211,6 +211,7 @@ void do_bad_area(unsigned long addr, unsigned int fsr, struct pt_regs *regs)
+ #ifdef CONFIG_MMU
+ #define VM_FAULT_BADMAP		0x010000
+ #define VM_FAULT_BADACCESS	0x020000
++#define VM_FAULT_LOG_VMOPS  0x1000000
+ 
+ /*
+  * Check that the permissions on the VMA allow for the fault which occurred.
+@@ -230,7 +231,7 @@ static inline bool access_error(unsigned int fsr, struct vm_area_struct *vma)
+ }
+ 
+ static int __kprobes
+-__do_page_fault(struct mm_struct *mm, unsigned long addr, unsigned int fsr,
++__do_page_fault(struct mm_struct *mm, unsigned long addr, unsigned long faulting_pc, unsigned int fsr,
+ 		unsigned int flags, struct task_struct *tsk)
+ {
+ 	struct vm_area_struct *vma;
+@@ -253,8 +254,44 @@ good_area:
+ 		goto out;
+ 	}
+ 
+-	return handle_mm_fault(mm, vma, addr & PAGE_MASK, flags);
++	fault = handle_mm_fault(mm, vma, addr & PAGE_MASK, flags);
++	if (!(fault & VM_FAULT_ERROR) && flags & FAULT_FLAG_ALLOW_RETRY) {
++		// Only want to log interesting faults: mapped or any hardfault for now.
++		// Later it may be interesting to log COW, stack growth etc.
++		if (atomic_read(&__tracepoint_page_fault_filt.key.enabled) > 0) {
++			int simpleperf = !strcmp(current->comm, "simpleperf");
++			if (!simpleperf && ((fault & VM_FAULT_MAJOR) || vma->vm_ops)) {
++				// Only log interesting faults: hard faults and ...
++				int log_flags = fault;
++				char* path = "";
++				char buf[256];
++				dev_t dev = 0;
++				ino_t ino = 0;
++				unsigned long vma_pgoff = 0;
++
++				if (vma->vm_ops) {
++					log_flags |= VM_FAULT_LOG_VMOPS;
++				}
++
++				if (vma->vm_file && vma->vm_file->f_mapping && vma->vm_file->f_mapping->host) {
++					struct inode *inode = vma->vm_file->f_mapping->host;
++					dev = inode->i_sb->s_dev;
++					ino = inode->i_ino;
++					path = d_path(&vma->vm_file->f_path, buf, sizeof(buf));
++					if (IS_ERR(path)) {
++						snprintf(buf, sizeof(buf), "<error:%ld>", PTR_ERR(path));
++						path = buf;
++					}
++				}
++
++				vma_pgoff = (unsigned long)vma->vm_pgoff << PAGE_SHIFT;
++				trace_page_fault_filt(addr, faulting_pc, vma->vm_start, vma->vm_end, vma_pgoff, log_flags, dev, ino, path);
++			}
++		}
++	}
+ 
++	return fault;
++	
+ check_stack:
+ 	/* Don't allow expansion below FIRST_USER_ADDRESS */
+ 	if (vma->vm_flags & VM_GROWSDOWN &&
+@@ -315,7 +352,7 @@ retry:
+ #endif
+ 	}
+ 
+-	fault = __do_page_fault(mm, addr, fsr, flags, tsk);
++	fault = __do_page_fault(mm, addr, regs->ARM_pc, fsr, flags, tsk);
+ 
+ 	/* If we need to retry but a fatal signal is pending, handle the
+ 	 * signal first. We do not need to release the mmap_sem because
+diff --git a/shamu/fs/drop_caches.c b/shamu/fs/drop_caches.c
+index c00e055b6..f6ede17f0 100644
+--- a/shamu/fs/drop_caches.c
++++ b/shamu/fs/drop_caches.c
+@@ -49,19 +49,71 @@ static void drop_slab(void)
+ 	} while (nr_objects > 10);
+ }
+ 
++void unmap_mapping_range_vma(struct vm_area_struct *vma,
++		unsigned long start_addr, unsigned long end_addr,
++		struct zap_details *details);
++
+ int drop_caches_sysctl_handler(ctl_table *table, int write,
+ 	void __user *buffer, size_t *length, loff_t *ppos)
+ {
+ 	int ret;
+ 
+-	ret = proc_dointvec_minmax(table, write, buffer, length, ppos);
++	ret = proc_dointvec(table, write, buffer, length, ppos);
+ 	if (ret)
+ 		return ret;
+ 	if (write) {
+-		if (sysctl_drop_caches & 1)
+-			iterate_supers(drop_pagecache_sb, NULL);
+-		if (sysctl_drop_caches & 2)
+-			drop_slab();
++		if (sysctl_drop_caches > 16) {
++			int pid = sysctl_drop_caches;
++			struct task_struct *task = NULL;
++			rcu_read_lock();
++			task = find_task_by_vpid(pid);
++			if (task)
++				get_task_struct(task);
++			rcu_read_unlock();
++			if (task) {
++				struct mm_struct *mm = get_task_mm(task);
++				printk(KERN_ERR "EMPTY: found proc %d\n", pid);
++				if (mm) {
++					char buf[256];
++					char* path = "";
++					struct vm_area_struct *vma;
++					struct zap_details details;
++					printk(KERN_ERR "EMPTY: found mm %d\n", pid);
++					details.nonlinear_vma = NULL;
++					details.first_index = 0;
++					details.last_index = -1;					
++					down_read(&mm->mmap_sem);
++					for (vma = mm->mmap; vma; vma = vma->vm_next) {
++							if (!vma->vm_file) {
++								continue;
++							}
++							if (vma->vm_flags & VM_LOCKED) {
++								continue;
++							}
++							path = d_path(&vma->vm_file->f_path, buf, sizeof(buf));
++							if (IS_ERR(path)) {
++								snprintf(buf, sizeof(buf), "<error:%ld>", PTR_ERR(path));
++								path = buf;
++							}
++							details.check_mapping = vma->vm_file->f_mapping;
++							printk(KERN_ERR "EMPTY: vma %lx %lx %s\n", vma->vm_start, vma->vm_end, path);
++							if (strncmp(path, "/dev/", 5) == 0) {
++								printk(KERN_ERR "  Skipping /dev/...\n");
++								continue;
++							}
++							unmap_mapping_range_vma(vma, vma->vm_start, vma->vm_end, &details);
++					}
++					up_read(&mm->mmap_sem);
++					mmput(mm);
++				}
++				put_task_struct(task);
++			}
++		} else {
++			if (sysctl_drop_caches & 1)
++				iterate_supers(drop_pagecache_sb, NULL);
++			if (sysctl_drop_caches & 2)
++				drop_slab();
++		}
+ 	}
+ 	return 0;
+ }
+diff --git a/shamu/include/trace/events/exception.h b/shamu/include/trace/events/exception.h
+index 69dbf7ceb..d45369a1a 100644
+--- a/shamu/include/trace/events/exception.h
++++ b/shamu/include/trace/events/exception.h
+@@ -84,6 +84,47 @@ TRACE_EVENT(unhandled_abort,
+ 	TP_printk("addr:%lu, fsr:%u", __entry->addr, __entry->fsr)
+ );
+ 
++TRACE_EVENT(page_fault_filt,
++
++       TP_PROTO(unsigned long addr, unsigned long faulting_pc, unsigned long vma_start, unsigned long vma_end, unsigned long vma_pgoff, unsigned int flags, dev_t dev, ino_t ino, char* path),
++
++       TP_ARGS(addr, faulting_pc, vma_start, vma_end, vma_pgoff, flags, dev, ino, path),
++
++       TP_STRUCT__entry(
++				 			 __field( unsigned long, addr )
++							 __field( unsigned long, faulting_pc )
++							 __field( unsigned long, vma_start )
++							 __field( unsigned long, vma_end )
++							 __field( unsigned long, vma_pgoff )
++				 			 __field( unsigned int, flags )
++							 __field( dev_t, dev )
++							 __field( ino_t, ino )
++							 __string( path,	path	)
++       ),
++
++       TP_fast_assign(
++				 			 __entry->addr = addr;
++							 __entry->faulting_pc = faulting_pc;
++							 __entry->vma_start = vma_start;
++							 __entry->vma_end = vma_end;
++							 __entry->vma_pgoff = vma_pgoff;
++							 __entry->flags = flags;
++							 __entry->dev = dev;
++							 __entry->ino = ino;
++							 __assign_str( path, path );
++       ),
++
++       TP_printk("%lx %lx %lx %lx %lx %x %d,%d %lu [%s]",
++			 					 __entry->addr,
++								 __entry->faulting_pc,
++								 __entry->vma_start,
++								 __entry->vma_end,
++								 __entry->vma_pgoff,
++								 __entry->flags,
++								 MAJOR(__entry->dev), MINOR(__entry->dev),
++								 (unsigned long)__entry->ino, __get_str(path))
++);
++
+ #endif
+ 
+ #include <trace/define_trace.h>
+diff --git a/shamu/mm/memory.c b/shamu/mm/memory.c
+index 970ae153d..8d8932796 100644
+--- a/shamu/mm/memory.c
++++ b/shamu/mm/memory.c
+@@ -2924,7 +2924,7 @@ unwritable_page:
+ 	return ret;
+ }
+ 
+-static void unmap_mapping_range_vma(struct vm_area_struct *vma,
++void unmap_mapping_range_vma(struct vm_area_struct *vma,
+ 		unsigned long start_addr, unsigned long end_addr,
+ 		struct zap_details *details)
+ {
+-- 
+2.17.1
+

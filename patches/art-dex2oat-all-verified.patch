@@ -1,0 +1,35 @@
+From a629a363df4744b8890ee2863bac860705da98dd Mon Sep 17 00:00:00 2001
+From: jacke <jacke@fb.com>
+Date: Wed, 13 Mar 2019 18:08:00 +0000
+Subject: [PATCH] Make all classes verified...
+
+Change-Id: I4db10e733d05b4cd02dffbf9c9f52b1073c2ac9b
+---
+ dex2oat/linker/oat_writer.cc | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/dex2oat/linker/oat_writer.cc b/dex2oat/linker/oat_writer.cc
+index c635d59cd7..ecde265eda 100644
+--- a/dex2oat/linker/oat_writer.cc
++++ b/dex2oat/linker/oat_writer.cc
+@@ -4339,11 +4339,16 @@ bool OatWriter::OatClassHeader::Write(OatWriter* oat_writer,
+                                       OutputStream* out,
+                                       const size_t file_offset) const {
+   DCHECK_OFFSET_();
+-  if (!out->WriteFully(&status_, sizeof(status_))) {
++  uint16_t status = status_;
++  if (status == enum_cast<uint16_t>(ClassStatus::kNotReady)) {
++    status = enum_cast<uint16_t>(ClassStatus::kVerified);
++  }
++
++  if (!out->WriteFully(&status, sizeof(status))) {
+     PLOG(ERROR) << "Failed to write class status to " << out->GetLocation();
+     return false;
+   }
+-  oat_writer->size_oat_class_status_ += sizeof(status_);
++  oat_writer->size_oat_class_status_ += sizeof(status);
+
+   if (!out->WriteFully(&type_, sizeof(type_))) {
+     PLOG(ERROR) << "Failed to write oat class type to " << out->GetLocation();
+--
+2.17.1
