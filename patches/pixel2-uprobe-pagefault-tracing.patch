@@ -1,0 +1,307 @@
+From 604c4ff83d2ab3e65d9edf1f8a5e770ba58659af Mon Sep 17 00:00:00 2001
+From: JackE <jacke@fb.com>
+Date: Mon, 13 May 2019 10:58:58 -0700
+Subject: [PATCH 3/4] Add pagefault traceprobe, support to empty process
+ working set pages
+
+---
+ arch/arm64/mm/fault.c            | 47 +++++++++++++++++--
+ fs/drop_caches.c                 | 79 ++++++++++++++++++++++++++------
+ include/trace/events/exception.h | 41 +++++++++++++++++
+ kernel/events/core.c             | 10 +++-
+ mm/memory.c                      |  2 +-
+ security/selinux/hooks.c         |  4 +-
+ 6 files changed, 162 insertions(+), 21 deletions(-)
+
+diff --git a/arch/arm64/mm/fault.c b/arch/arm64/mm/fault.c
+index 3f34f070da35..b96444493057 100644
+--- a/arch/arm64/mm/fault.c
++++ b/arch/arm64/mm/fault.c
+@@ -237,8 +237,10 @@ static void do_bad_area(unsigned long addr, unsigned int esr, struct pt_regs *re
+ 
+ #define VM_FAULT_BADMAP		0x010000
+ #define VM_FAULT_BADACCESS	0x020000
++#define VM_FAULT_LOG_VMOPS  0x1000000
++#define VM_FAULT_LOG_USER   0x2000000
+ 
+-static int __do_page_fault(struct mm_struct *mm, unsigned long addr,
++static int __do_page_fault(struct mm_struct *mm, unsigned long addr, unsigned long faulting_pc,
+ 			   unsigned int mm_flags, unsigned long vm_flags,
+ 			   struct task_struct *tsk)
+ {
+@@ -267,7 +269,46 @@ good_area:
+ 		goto out;
+ 	}
+ 
+-	return handle_mm_fault(mm, vma, addr & PAGE_MASK, mm_flags);
++	fault = handle_mm_fault(mm, vma, addr & PAGE_MASK, mm_flags);
++	if (!(fault & VM_FAULT_ERROR) && mm_flags & FAULT_FLAG_ALLOW_RETRY) {
++		// Only want to log interesting faults: mapped or any hardfault for now.
++		// Later it may be interesting to log COW, stack growth etc.
++		if (atomic_read(&__tracepoint_page_fault_filt.key.enabled) > 0) {
++			int simpleperf = !strcmp(current->comm, "simpleperf");
++			if (!simpleperf && ((fault & VM_FAULT_MAJOR) || vma->vm_ops)) {
++				// Only log interesting faults: hard faults and ...
++				int log_flags = fault;
++				char* path = "";
++				char buf[256];
++				dev_t dev = 0;
++				ino_t ino = 0;
++				unsigned long vma_pgoff = 0;
++
++				if (vma->vm_ops) {
++					log_flags |= VM_FAULT_LOG_VMOPS;
++				}
++				if (mm_flags & FAULT_FLAG_USER) {
++					log_flags |= VM_FAULT_LOG_USER;
++				}
++
++				if (vma->vm_file && vma->vm_file->f_mapping && vma->vm_file->f_mapping->host) {
++					struct inode *inode = vma->vm_file->f_mapping->host;
++					dev = inode->i_sb->s_dev;
++					ino = inode->i_ino;
++					path = d_path(&vma->vm_file->f_path, buf, sizeof(buf));
++					if (IS_ERR(path)) {
++						snprintf(buf, sizeof(buf), "<error:%ld>", PTR_ERR(path));
++						path = buf;
++					}
++				}
++
++				vma_pgoff = (unsigned long)vma->vm_pgoff << PAGE_SHIFT;
++				trace_page_fault_filt(addr, faulting_pc, vma->vm_start, vma->vm_end, vma_pgoff, log_flags, dev, ino, path);
++			}
++		}
++	}
++
++	return fault;
+ 
+ check_stack:
+ 	if (vma->vm_flags & VM_GROWSDOWN && !expand_stack(vma, addr))
+@@ -367,7 +408,7 @@ retry:
+ #endif
+ 	}
+ 
+-	fault = __do_page_fault(mm, addr, mm_flags, vm_flags, tsk);
++	fault = __do_page_fault(mm, addr, regs->pc, mm_flags, vm_flags, tsk);
+ 
+ 	/*
+ 	 * If we need to retry but a fatal signal is pending, handle the
+diff --git a/fs/drop_caches.c b/fs/drop_caches.c
+index ddf319bcfccd..6bc7308c3f5f 100644
+--- a/fs/drop_caches.c
++++ b/fs/drop_caches.c
+@@ -39,31 +39,82 @@ void drop_pagecache_sb(struct super_block *sb, void *unused)
+ 	iput(toput_inode);
+ }
+ 
++void unmap_mapping_range_vma(struct vm_area_struct *vma,
++		unsigned long start_addr, unsigned long end_addr,
++		struct zap_details *details);
++
+ int drop_caches_sysctl_handler(struct ctl_table *table, int write,
+ 	void __user *buffer, size_t *length, loff_t *ppos)
+ {
+ 	int ret;
+ 
+-	ret = proc_dointvec_minmax(table, write, buffer, length, ppos);
++	ret = proc_dointvec(table, write, buffer, length, ppos);
+ 	if (ret)
+ 		return ret;
+ 	if (write) {
+ 		static int stfu;
+ 
+-		if (sysctl_drop_caches & 1) {
+-			iterate_supers(drop_pagecache_sb, NULL);
+-			count_vm_event(DROP_PAGECACHE);
+-		}
+-		if (sysctl_drop_caches & 2) {
+-			drop_slab();
+-			count_vm_event(DROP_SLAB);
+-		}
+-		if (!stfu) {
+-			pr_info("%s (%d): drop_caches: %d\n",
+-				current->comm, task_pid_nr(current),
+-				sysctl_drop_caches);
++		if (sysctl_drop_caches > 16) {
++			int pid = sysctl_drop_caches;
++			struct task_struct *task = NULL;
++			rcu_read_lock();
++			task = find_task_by_vpid(pid);
++			if (task)
++				get_task_struct(task);
++			rcu_read_unlock();
++			if (task) {
++				struct mm_struct *mm = get_task_mm(task);
++				printk(KERN_ERR "EMPTY: found proc %d\n", pid);
++				if (mm) {
++					char buf[256];
++					char* path = "";
++					struct vm_area_struct *vma;
++					struct zap_details details = {};
++					printk(KERN_ERR "EMPTY: found mm %d\n", pid);
++					details.first_index = 0;
++					details.last_index = -1;					
++					down_read(&mm->mmap_sem);
++					for (vma = mm->mmap; vma; vma = vma->vm_next) {
++							if (!vma->vm_file) {
++								continue;
++							}
++							if (vma->vm_flags & VM_LOCKED) {
++								continue;
++							}
++							path = d_path(&vma->vm_file->f_path, buf, sizeof(buf));
++							if (IS_ERR(path)) {
++								snprintf(buf, sizeof(buf), "<error:%ld>", PTR_ERR(path));
++								path = buf;
++							}
++							details.check_mapping = vma->vm_file->f_mapping;
++							printk(KERN_ERR "EMPTY: vma %lx %lx %s\n", vma->vm_start, vma->vm_end, path);
++							if (strncmp(path, "/dev/", 5) == 0) {
++								printk(KERN_ERR "  Skipping /dev/...\n");
++								continue;
++							}
++							unmap_mapping_range_vma(vma, vma->vm_start, vma->vm_end, &details);
++					}
++					up_read(&mm->mmap_sem);
++					mmput(mm);
++				}
++				put_task_struct(task);
++			}
++		} else {
++			if (sysctl_drop_caches & 1) {
++				iterate_supers(drop_pagecache_sb, NULL);
++				count_vm_event(DROP_PAGECACHE);
++			}
++			if (sysctl_drop_caches & 2) {
++				drop_slab();
++				count_vm_event(DROP_SLAB);
++			}
++			if (!stfu) {
++				pr_info("%s (%d): drop_caches: %d\n",
++					current->comm, task_pid_nr(current),
++					sysctl_drop_caches);
++			}
++			stfu |= sysctl_drop_caches & 4;
+ 		}
+-		stfu |= sysctl_drop_caches & 4;
+ 	}
+ 	return 0;
+ }
+diff --git a/include/trace/events/exception.h b/include/trace/events/exception.h
+index 6b525da1432e..14a178d4b549 100644
+--- a/include/trace/events/exception.h
++++ b/include/trace/events/exception.h
+@@ -119,6 +119,47 @@ TRACE_EVENT(kernel_panic_late,
+ 	TP_printk("dummy:%ld", __entry->dummy)
+ );
+ 
++TRACE_EVENT(page_fault_filt,
++
++       TP_PROTO(unsigned long addr, unsigned long faulting_pc, unsigned long vma_start, unsigned long vma_end, unsigned long vma_pgoff, unsigned int flags, dev_t dev, ino_t ino, char* path),
++
++       TP_ARGS(addr, faulting_pc, vma_start, vma_end, vma_pgoff, flags, dev, ino, path),
++
++       TP_STRUCT__entry(
++				 			 __field( unsigned long, addr )
++							 __field( unsigned long, faulting_pc )
++							 __field( unsigned long, vma_start )
++							 __field( unsigned long, vma_end )
++							 __field( unsigned long, vma_pgoff )
++				 			 __field( unsigned int, flags )
++							 __field( dev_t, dev )
++							 __field( ino_t, ino )
++							 __string( path,	path	)
++       ),
++
++       TP_fast_assign(
++				 			 __entry->addr = addr;
++							 __entry->faulting_pc = faulting_pc;
++							 __entry->vma_start = vma_start;
++							 __entry->vma_end = vma_end;
++							 __entry->vma_pgoff = vma_pgoff;
++							 __entry->flags = flags;
++							 __entry->dev = dev;
++							 __entry->ino = ino;
++							 __assign_str( path, path );
++       ),
++
++       TP_printk("%lx %lx %lx %lx %lx %x %d,%d %lu [%s]",
++			 					 __entry->addr,
++								 __entry->faulting_pc,
++								 __entry->vma_start,
++								 __entry->vma_end,
++								 __entry->vma_pgoff,
++								 __entry->flags,
++								 MAJOR(__entry->dev), MINOR(__entry->dev),
++								 (unsigned long)__entry->ino, __get_str(path))
++);
++
+ #endif
+ 
+ #include <trace/define_trace.h>
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+index 5a2a173e54f1..2f8be34ded6e 100644
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -60,6 +60,10 @@ struct remote_function_call {
+ 	int			ret;
+ };
+ 
++static int no_stacks_for_current_task(void ) {
++	return (strcmp(current->comm, "simpleperf") == 0);
++}
++
+ static void remote_function(void *data)
+ {
+ 	struct remote_function_call *tfc = data;
+@@ -5240,6 +5244,10 @@ perf_sample_ustack_size(u16 stack_size, u16 header_size,
+ 	if (!regs)
+ 		return 0;
+ 
++	if (no_stacks_for_current_task()) {
++		return 0;
++	}
++
+ 	/*
+ 	 * Check if we fit in with the requested stack size into the:
+ 	 * - TASK_SIZE
+@@ -5274,7 +5282,7 @@ perf_output_sample_ustack(struct perf_output_handle *handle, u64 dump_size,
+ 			  struct pt_regs *regs)
+ {
+ 	/* Case of a kernel thread, nothing to dump */
+-	if (!regs) {
++	if (!regs || no_stacks_for_current_task()) {
+ 		u64 size = 0;
+ 		perf_output_put(handle, size);
+ 	} else {
+diff --git a/mm/memory.c b/mm/memory.c
+index 37f1591cbaf6..30e16f9051eb 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -2432,7 +2432,7 @@ static int do_wp_page(struct mm_struct *mm, struct vm_area_struct *vma,
+ 			    orig_pte, old_page);
+ }
+ 
+-static void unmap_mapping_range_vma(struct vm_area_struct *vma,
++void unmap_mapping_range_vma(struct vm_area_struct *vma,
+ 		unsigned long start_addr, unsigned long end_addr,
+ 		struct zap_details *details)
+ {
+diff --git a/security/selinux/hooks.c b/security/selinux/hooks.c
+index e57f8cbb7e4a..62c8b817dc12 100644
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@ -103,8 +103,8 @@ int selinux_enforcing;
+ static int __init enforcing_setup(char *str)
+ {
+ 	unsigned long enforcing;
+-//	if (!kstrtoul(str, 0, &enforcing))
+-//		selinux_enforcing = enforcing ? 1 : 0;
++	if (!kstrtoul(str, 0, &enforcing))
++		selinux_enforcing = enforcing ? 1 : 0;
+ 	selinux_enforcing = 0;
+ 	return 1;
+ }
+-- 
+2.17.1
+

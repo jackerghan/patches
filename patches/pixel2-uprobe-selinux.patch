@@ -1,0 +1,56 @@
+From de802006f0655eef23aa5fb8a2ff4c5bdd03648f Mon Sep 17 00:00:00 2001
+From: JackE <jacke@fb.com>
+Date: Mon, 4 Feb 2019 10:32:56 -0800
+Subject: [PATCH 1/4] Force selinux into permissive mode to allow root adbd
+ etc.
+
+---
+ security/selinux/hooks.c     |  5 +++--
+ security/selinux/selinuxfs.c | 15 ---------------
+ 2 files changed, 3 insertions(+), 17 deletions(-)
+
+diff --git a/security/selinux/hooks.c b/security/selinux/hooks.c
+index 79a8b3aceabe..e57f8cbb7e4a 100644
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@ -103,8 +103,9 @@ int selinux_enforcing;
+ static int __init enforcing_setup(char *str)
+ {
+ 	unsigned long enforcing;
+-	if (!kstrtoul(str, 0, &enforcing))
+-		selinux_enforcing = enforcing ? 1 : 0;
++//	if (!kstrtoul(str, 0, &enforcing))
++//		selinux_enforcing = enforcing ? 1 : 0;
++	selinux_enforcing = 0;
+ 	return 1;
+ }
+ __setup("enforcing=", enforcing_setup);
+diff --git a/security/selinux/selinuxfs.c b/security/selinux/selinuxfs.c
+index c02da25d7b63..fb9c9dae76b7 100644
+--- a/security/selinux/selinuxfs.c
++++ b/security/selinux/selinuxfs.c
+@@ -169,21 +169,6 @@ static ssize_t sel_write_enforce(struct file *file, const char __user *buf,
+ 	if (sscanf(page, "%d", &new_value) != 1)
+ 		goto out;
+ 
+-	if (new_value != selinux_enforcing) {
+-		length = task_has_security(current, SECURITY__SETENFORCE);
+-		if (length)
+-			goto out;
+-		audit_log(current->audit_context, GFP_KERNEL, AUDIT_MAC_STATUS,
+-			"enforcing=%d old_enforcing=%d auid=%u ses=%u",
+-			new_value, selinux_enforcing,
+-			from_kuid(&init_user_ns, audit_get_loginuid(current)),
+-			audit_get_sessionid(current));
+-		selinux_enforcing = new_value;
+-		if (selinux_enforcing)
+-			avc_ss_reset(0);
+-		selnl_notify_setenforce(selinux_enforcing);
+-		selinux_status_update_setenforce(selinux_enforcing);
+-	}
+ 	length = count;
+ out:
+ 	free_page((unsigned long) page);
+-- 
+2.17.1
+
