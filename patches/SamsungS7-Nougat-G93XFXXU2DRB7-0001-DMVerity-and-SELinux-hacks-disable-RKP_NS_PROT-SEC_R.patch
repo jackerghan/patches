@@ -1,0 +1,340 @@
+From 782b882e60e952283afa75cd65152938bf1494d1 Mon Sep 17 00:00:00 2001
+From: jacke <jacke@fb.com>
+Date: Thu, 20 Jun 2019 16:52:29 +0000
+Subject: [PATCH 1/3] DMVerity and SELinux hacks, disable RKP_NS_PROT,
+ SEC_RESTRICT_*
+
+---
+ .../configs/exynos8890-herolte_defconfig      | 12 +--
+ drivers/md/dm-verity-fec.c                    |  2 +-
+ drivers/md/dm-verity-target.c                 | 79 +------------------
+ security/selinux_n/Makefile                   |  2 +-
+ security/selinux_n/avc.c                      | 61 --------------
+ security/selinux_n/hooks.c                    |  1 +
+ security/selinux_n/selinuxfs.c                | 32 --------
+ 7 files changed, 13 insertions(+), 176 deletions(-)
+
+diff --git a/arch/arm64/configs/exynos8890-herolte_defconfig b/arch/arm64/configs/exynos8890-herolte_defconfig
+index 28cf90fb0..ff270eca9 100755
+--- a/arch/arm64/configs/exynos8890-herolte_defconfig
++++ b/arch/arm64/configs/exynos8890-herolte_defconfig
+@@ -348,7 +348,7 @@ CONFIG_TIMA=y
+ CONFIG_TIMA_RKP=y
+ # CONFIG_TIMA_RKP_DEBUG is not set
+ CONFIG_RKP_KDP=y
+-CONFIG_RKP_NS_PROT=y
++CONFIG_RKP_NS_PROT=n
+ CONFIG_RKP_DMAP_PROT=y
+ CONFIG_ARM64_4K_PAGES=y
+ # CONFIG_ARM64_64K_PAGES is not set
+@@ -545,9 +545,9 @@ CONFIG_EXYNOS_BIG_FREQ_BOOST=y
+ #
+ # Control Flow Protection
+ #
+-CONFIG_RKP_CFP=y
++CONFIG_RKP_CFP=n
+ # CONFIG_RKP_CFP_ROPP is not set
+-CONFIG_RKP_CFP_JOPP=y
++CONFIG_RKP_CFP_JOPP=n
+ CONFIG_RKP_CFP_JOPP_MAGIC=0x00be7bad
+ CONFIG_NET=y
+ CONFIG_COMPAT_NETLINK_MESSAGES=y
+@@ -4724,9 +4724,9 @@ CONFIG_HAVE_ARCH_KGDB=y
+ #
+ # Samsung Rooting Restriction Feature
+ #
+-CONFIG_SEC_RESTRICT_ROOTING=y
+-CONFIG_SEC_RESTRICT_SETUID=y
+-CONFIG_SEC_RESTRICT_FORK=y
++CONFIG_SEC_RESTRICT_ROOTING=n
++CONFIG_SEC_RESTRICT_SETUID=n
++CONFIG_SEC_RESTRICT_FORK=n
+ CONFIG_SEC_RESTRICT_ROOTING_LOG=y
+ 
+ #
+diff --git a/drivers/md/dm-verity-fec.c b/drivers/md/dm-verity-fec.c
+index 1dd667b97..de818c932 100644
+--- a/drivers/md/dm-verity-fec.c
++++ b/drivers/md/dm-verity-fec.c
+@@ -20,7 +20,7 @@
+  */
+ bool verity_fec_is_enabled(struct dm_verity *v)
+ {
+-	return v->fec && v->fec->dev;
++	return false;
+ }
+ 
+ /*
+diff --git a/drivers/md/dm-verity-target.c b/drivers/md/dm-verity-target.c
+index 659109307..2d6ae3e28 100755
+--- a/drivers/md/dm-verity-target.c
++++ b/drivers/md/dm-verity-target.c
+@@ -42,8 +42,6 @@
+ 
+ #define DM_VERITY_OPTS_MAX		(2 + DM_VERITY_OPTS_FEC)
+ 
+-#define SEC_HEX_DEBUG
+-
+ static unsigned dm_verity_prefetch_cluster = DM_VERITY_DEFAULT_PREFETCH_SIZE;
+ #ifdef SEC_HEX_DEBUG
+ static void print_block_data(unsigned long long blocknr, unsigned char *data_to_dump
+@@ -269,63 +267,13 @@ out:
+ 	if (v->mode == DM_VERITY_MODE_LOGGING)
+ 		return 0;
+ 
+-	if (v->mode == DM_VERITY_MODE_RESTART)
+-		kernel_restart("dm-verity device corrupted");
+-
+-	return 1;
++	return 0;
+ }
+ #else
+ static int verity_handle_err(struct dm_verity *v, enum verity_block_type type,
+ 			     unsigned long long block)
+ {
+-	char verity_env[DM_VERITY_ENV_LENGTH];
+-	char *envp[] = { verity_env, NULL };
+-	const char *type_str = "";
+-	struct mapped_device *md = dm_table_get_md(v->ti->table);
+-
+-	/* Corruption should be visible in device status in all modes */
+-	v->hash_failed = 1;
+-
+-	if(block == 0){
+-        DMERR("%s: block 0 is superblock. Skipping verity_handle_err" , v->data_dev->name);
+-        return 0 ;
+-	}
+-	
+-	if (v->corrupted_errs >= DM_VERITY_MAX_CORRUPTED_ERRS)
+-		goto out;
+-
+-	v->corrupted_errs++;
+-
+-	switch (type) {
+-	case DM_VERITY_BLOCK_TYPE_DATA:
+-		type_str = "data";
+-		break;
+-	case DM_VERITY_BLOCK_TYPE_METADATA:
+-		type_str = "metadata";
+-		break;
+-	default:
+-		BUG();
+-	}
+-
+-	DMERR("%s: %s block %llu is corrupted", v->data_dev->name, type_str,
+-		block);
+-
+-	if (v->corrupted_errs == DM_VERITY_MAX_CORRUPTED_ERRS)
+-		DMERR("%s: reached maximum errors", v->data_dev->name);
+-
+-	snprintf(verity_env, DM_VERITY_ENV_LENGTH, "%s=%d,%llu",
+-		DM_VERITY_ENV_VAR_NAME, type, block);
+-
+-	kobject_uevent_env(&disk_to_dev(dm_disk(md))->kobj, KOBJ_CHANGE, envp);
+-
+-out:
+-	if (v->mode == DM_VERITY_MODE_LOGGING)
+-		return 0;
+-
+-	if (v->mode == DM_VERITY_MODE_RESTART)
+-		kernel_restart("dm-verity device corrupted");
+-
+-	return 1;
++	return 0;
+ }
+ #endif
+ 
+@@ -371,6 +319,7 @@ static int verity_verify_level(struct dm_verity *v, struct dm_verity_io *io,
+ 		if (unlikely(r < 0))
+ 			goto release_ret_r;
+ 
++		aux->hash_verified = 1;
+ 		if (io->block != 0) {
+ 			if (likely(memcmp(verity_io_real_digest(v, io), want_digest,
+ 					  v->digest_size) == 0))
+@@ -530,13 +479,6 @@ static int verity_bv_hash_update(struct dm_verity *v, struct dm_verity_io *io,
+ 	return verity_hash_update(v, verity_io_hash_desc(v, io), data, len);
+ }
+ 
+-static int verity_bv_zero(struct dm_verity *v, struct dm_verity_io *io,
+-			  u8 *data, size_t len)
+-{
+-	memset(data, 0, len);
+-	return 0;
+-}
+-
+ /*
+  * Verify one "dm_verity_io" structure.
+  */
+@@ -557,19 +499,6 @@ static int verity_verify_io(struct dm_verity_io *io)
+ 		if (unlikely(r < 0))
+ 			return r;
+ 
+-		if (is_zero) {
+-			/*
+-			 * If we expect a zero block, don't validate, just
+-			 * return zeros.
+-			 */
+-			r = verity_for_bv_block(v, io, &io->iter,
+-						verity_bv_zero);
+-			if (unlikely(r < 0))
+-				return r;
+-
+-			continue;
+-		}
+-
+ 		r = verity_hash_init(v, desc);
+ 		if (unlikely(r < 0))
+ 			return r;
+@@ -948,7 +877,7 @@ static int verity_parse_opt_args(struct dm_arg_set *as, struct dm_verity *v)
+ 			continue;
+ 
+ 		} else if (!strcasecmp(arg_name, DM_VERITY_OPT_RESTART)) {
+-			v->mode = DM_VERITY_MODE_RESTART;
++			v->mode = DM_VERITY_MODE_LOGGING;
+ 			continue;
+ 
+ 		} else if (!strcasecmp(arg_name, DM_VERITY_OPT_IGN_ZEROES)) {
+diff --git a/security/selinux_n/Makefile b/security/selinux_n/Makefile
+index cdfb74751..6e7dd73ae 100644
+--- a/security/selinux_n/Makefile
++++ b/security/selinux_n/Makefile
+@@ -14,7 +14,7 @@ endif
+ ifeq ($(TARGET_BUILD_VARIANT), user)
+ ifeq ($(SEC_BUILD_OPTION_PRODUCT_SHIP), true)
+ ifeq ($(SEC_BUILD_OPTION_SELINUX_ENFORCE),true)
+-EXTRA_CFLAGS += -DCONFIG_ALWAYS_ENFORCE=true
++#EXTRA_CFLAGS += -DCONFIG_ALWAYS_ENFORCE=true
+ endif
+ endif
+ endif
+diff --git a/security/selinux_n/avc.c b/security/selinux_n/avc.c
+index 47b9eb86f..e377668be 100644
+--- a/security/selinux_n/avc.c
++++ b/security/selinux_n/avc.c
+@@ -993,67 +993,6 @@ static noinline int avc_denied(u32 ssid, u32 tsid,
+ 				u8 driver, u8 xperm, unsigned flags,
+ 				struct av_decision *avd)
+ {
+-	if (flags & AVC_STRICT)
+-		return -EACCES;
+-
+-// [ SEC_SELINUX_PORTING_COMMON
+-#ifdef SEC_SELINUX_DEBUG
+-
+-        /* SEC_SELINUX : denied && auditallow means "never happen" at current sepolicy. Valid Enforcing denial only. */
+-	if ( (requested & avd->auditallow) && selinux_enforcing && !(avd->flags & AVD_FLAGS_PERMISSIVE) )  {
+-
+-		char *scontext, *tcontext;
+-		const char **perms;
+-		int i, perm;
+-		int rc1, rc2;
+-		u32 scontext_len, tcontext_len;
+-
+-		perms = secclass_map[tclass-1].perms;
+-		i = 0;
+-		perm = 1;
+-		while (i < (sizeof(requested) * 8)) {
+-			if ((perm & requested) && perms[i])
+-				break;
+-			i++;
+-			perm <<= 1;
+-		}
+-
+-		rc1 = security_sid_to_context(ssid, &scontext, &scontext_len);
+-		rc2 = security_sid_to_context(tsid, &tcontext, &tcontext_len);
+-
+-		if (rc1 || rc2) {
+-			printk(KERN_ERR "SELinux DEBUG : %s: ssid=%d tsid=%d tclass=%s perm=%s requested(%d) auditallow(%d)\n",
+-		       __func__, ssid, tsid, secclass_map[tclass-1].name, perms[i], requested, avd->auditallow);
+-		}
+-		else {
+-			printk(KERN_ERR "SELinux DEBUG : %s: scontext=%s tcontext=%s tclass=%s perm=%s requested(%d) auditallow(%d)\n",
+-		       __func__, scontext, tcontext, secclass_map[tclass-1].name, perms[i], requested, avd->auditallow);
+-		}
+-
+-		/* print call stack */
+-		printk(KERN_ERR "SELinux DEBUG : FATAL denial and start dump_stack\n");
+-		dump_stack();
+-
+-		/* enforcing : SIGABRT and take debuggerd log */
+-		if (selinux_enforcing && !(avd->flags & AVD_FLAGS_PERMISSIVE)) {
+-			printk(KERN_ERR "SELinux DEBUG : send SIGABRT to current tsk\n");
+-			send_sig(SIGABRT, current, 2);
+-		}
+-
+-		if (!rc1) kfree(scontext);
+-		if (!rc2) kfree(tcontext);
+-
+-	}
+-#endif
+-
+-#ifdef CONFIG_ALWAYS_ENFORCE
+-	if (!(avd->flags & AVD_FLAGS_PERMISSIVE))
+-#else
+-	if (selinux_enforcing && !(avd->flags & AVD_FLAGS_PERMISSIVE))
+-#endif
+-// ] SEC_SELINUX_PORTING_COMMON
+-		return -EACCES;
+-
+ 	avc_update_node(AVC_CALLBACK_GRANT, requested, driver, xperm, ssid,
+ 				tsid, tclass, avd->seqno, NULL, flags);
+ 	return 0;
+diff --git a/security/selinux_n/hooks.c b/security/selinux_n/hooks.c
+index 89072ec7c..9e3fa3cab 100644
+--- a/security/selinux_n/hooks.c
++++ b/security/selinux_n/hooks.c
+@@ -195,6 +195,7 @@ static int __init enforcing_setup(char *str)
+ 		selinux_enforcing = enforcing ? 1 : 0;
+ #endif
+ // ] SEC_SELINUX_PORTING_COMMON
++	selinux_enforcing = 0;
+ 	return 1;
+ }
+ __setup("enforcing=", enforcing_setup);
+diff --git a/security/selinux_n/selinuxfs.c b/security/selinux_n/selinuxfs.c
+index b40c063db..a2581fd69 100644
+--- a/security/selinux_n/selinuxfs.c
++++ b/security/selinux_n/selinuxfs.c
+@@ -173,38 +173,6 @@ static ssize_t sel_write_enforce(struct file *file, const char __user *buf,
+ 	if (sscanf(page, "%d", &new_value) != 1)
+ 		goto out;
+ 
+-// [ SEC_SELINUX_PORTING_COMMON
+-#ifdef CONFIG_ALWAYS_ENFORCE
+-	// If build is user build and enforce option is set, selinux is always enforcing
+-	new_value = 1;
+-	length = task_has_security(current, SECURITY__SETENFORCE);
+-	audit_log(current->audit_context, GFP_KERNEL, AUDIT_MAC_STATUS,
+-                        "config_always_enforce - true; enforcing=%d old_enforcing=%d auid=%u ses=%u",
+-                        new_value, selinux_enforcing,
+-                        from_kuid(&init_user_ns, audit_get_loginuid(current)),
+-                        audit_get_sessionid(current));
+-	selinux_enforcing = new_value;
+-	avc_ss_reset(0);
+-	selnl_notify_setenforce(new_value);
+-	selinux_status_update_setenforce(new_value);
+-#else
+-	if (new_value != selinux_enforcing) {
+-		length = task_has_security(current, SECURITY__SETENFORCE);
+-		if (length)
+-			goto out;
+-		audit_log(current->audit_context, GFP_KERNEL, AUDIT_MAC_STATUS,
+-			"enforcing=%d old_enforcing=%d auid=%u ses=%u",
+-			new_value, selinux_enforcing,
+-			from_kuid(&init_user_ns, audit_get_loginuid(current)),
+-			audit_get_sessionid(current));
+-		selinux_enforcing = new_value;
+-		if (selinux_enforcing)
+-			avc_ss_reset(0);
+-		selnl_notify_setenforce(selinux_enforcing);
+-		selinux_status_update_setenforce(selinux_enforcing);
+-	}
+-#endif
+-// ] SEC_SELINUX_PORTING_COMMON
+ 	length = count;
+ 
+ #if defined(CONFIG_TZ_ICCC)
+-- 
+2.17.1
+

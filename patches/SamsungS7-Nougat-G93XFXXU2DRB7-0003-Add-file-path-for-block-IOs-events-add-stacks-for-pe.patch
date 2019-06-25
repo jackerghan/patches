@@ -1,0 +1,508 @@
+From c3c9a3d82b49bed7efc8143b1db07405b8fbb0da Mon Sep 17 00:00:00 2001
+From: jacke <jacke@fb.com>
+Date: Tue, 25 Jun 2019 23:02:52 +0000
+Subject: [PATCH 3/3] Add file path for block IOs events, add stacks for
+ perf_events
+
+---
+ arch/arm64/include/asm/perf_event.h    | 11 +++++-
+ arch/arm64/include/asm/stack_pointer.h |  9 +++++
+ block/blk-core.c                       | 28 ++++++++++++++
+ fs/block_dev.c                         |  4 +-
+ fs/buffer.c                            | 18 ++++++++-
+ fs/ext4/ext4.h                         | 16 ++++++++
+ fs/ext4/inode.c                        | 53 +++++++++++++++++++++++++-
+ fs/ext4/namei.c                        |  2 +
+ fs/ext4/super.c                        |  1 +
+ fs/fs-writeback.c                      |  3 ++
+ fs/jbd2/commit.c                       |  2 +
+ fs/jbd2/journal.c                      |  1 +
+ include/linux/buffer_head.h            |  2 +
+ include/linux/fs.h                     |  1 +
+ include/trace/events/block.h           | 28 ++++++++++++++
+ include/trace/events/ext4.h            | 26 +++++++++++++
+ kernel/trace/trace.c                   |  6 +++
+ 17 files changed, 206 insertions(+), 5 deletions(-)
+ create mode 100644 arch/arm64/include/asm/stack_pointer.h
+
+diff --git a/arch/arm64/include/asm/perf_event.h b/arch/arm64/include/asm/perf_event.h
+index d26d1d53c..91b6be092 100644
+--- a/arch/arm64/include/asm/perf_event.h
++++ b/arch/arm64/include/asm/perf_event.h
+@@ -17,11 +17,20 @@
+ #ifndef __ASM_PERF_EVENT_H
+ #define __ASM_PERF_EVENT_H
+ 
+-#ifdef CONFIG_HW_PERF_EVENTS
++#include <asm/stack_pointer.h>
++
++#ifdef CONFIG_PERF_EVENTS
+ struct pt_regs;
+ extern unsigned long perf_instruction_pointer(struct pt_regs *regs);
+ extern unsigned long perf_misc_flags(struct pt_regs *regs);
+ #define perf_misc_flags(regs)	perf_misc_flags(regs)
+ #endif
+ 
++#define perf_arch_fetch_caller_regs(regs, __ip) { \
++	(regs)->pc = (__ip);    \
++	(regs)->regs[29] = (unsigned long) __builtin_frame_address(0); \
++	(regs)->sp = current_stack_pointer; \
++	(regs)->pstate = PSR_MODE_EL1h;	\
++}
++
+ #endif
+diff --git a/arch/arm64/include/asm/stack_pointer.h b/arch/arm64/include/asm/stack_pointer.h
+new file mode 100644
+index 000000000..ffcdf742c
+--- /dev/null
++++ b/arch/arm64/include/asm/stack_pointer.h
+@@ -0,0 +1,9 @@
++#ifndef __ASM_STACK_POINTER_H
++#define __ASM_STACK_POINTER_H
++
++/*
++ * how to get the current stack pointer from C
++ */
++register unsigned long current_stack_pointer asm ("sp");
++
++#endif /* __ASM_STACK_POINTER_H */
+diff --git a/block/blk-core.c b/block/blk-core.c
+index 5a1cc584e..2d98240df 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -1922,6 +1922,9 @@ void generic_make_request(struct bio *bio)
+ }
+ EXPORT_SYMBOL(generic_make_request);
+ 
++void end_bio_bh_io_sync(struct bio *bio, int err);
++void ext4_trace_inode_path(struct file *filp, struct inode *inode);
++
+ /**
+  * submit_bio - submit a bio to the block device layer for I/O
+  * @rw: whether to %READ or %WRITE, or maybe to %READA (read ahead)
+@@ -1943,6 +1946,31 @@ void submit_bio(int rw, struct bio *bio)
+ 	if (bio_has_data(bio)) {
+ 		unsigned int count;
+ 
++		if (atomic_read(&__tracepoint_block_bio_submit.key.enabled) > 0) {
++			struct page *page = bio_page(bio);
++			struct address_space *mapping = page ? page_mapping(page) : NULL;
++			struct inode *inode = mapping ? mapping->host : NULL;
++			unsigned long ino = 0;
++			char *name = "";
++			if (inode) {
++				if (!inode->i_ino) {
++					if ((void*)bio->bi_end_io == (void*)end_bio_bh_io_sync) {
++						struct buffer_head *bh = bio->bi_private;
++						if (bh->b_ino) {
++							ino = bh->b_ino;
++						}
++						if (bh->b_name) {
++							name = bh->b_name;
++						}
++					}
++				} else {
++					ino = inode->i_ino;
++					ext4_trace_inode_path(NULL, inode);
++				}
++				trace_block_bio_submit(bio, ino, name);
++			}
++		}
++
+ 		if (unlikely(rw & REQ_WRITE_SAME))
+ 			count = bdev_logical_block_size(bio->bi_bdev) >> 9;
+ 		else
+diff --git a/fs/block_dev.c b/fs/block_dev.c
+index 1d9c9f375..13e999efa 100644
+--- a/fs/block_dev.c
++++ b/fs/block_dev.c
+@@ -289,9 +289,11 @@ static int blkdev_writepage(struct page *page, struct writeback_control *wbc)
+ 	return block_write_full_page(page, blkdev_get_block, wbc);
+ }
+ 
++int __block_read_full_page(struct page *page, get_block_t *get_block, struct file *file);
++
+ static int blkdev_readpage(struct file * file, struct page * page)
+ {
+-	return block_read_full_page(page, blkdev_get_block);
++	return __block_read_full_page(page, blkdev_get_block, file);
+ }
+ 
+ static int blkdev_readpages(struct file *file, struct address_space *mapping,
+diff --git a/fs/buffer.c b/fs/buffer.c
+index 03077efb4..7ccdae194 100644
+--- a/fs/buffer.c
++++ b/fs/buffer.c
+@@ -2204,6 +2204,8 @@ int block_is_partially_uptodate(struct page *page, unsigned long from,
+ }
+ EXPORT_SYMBOL(block_is_partially_uptodate);
+ 
++void ext4_trace_inode_path(struct file *filp, struct inode *inode);
++
+ /*
+  * Generic "read page" function for block devices that have the normal
+  * get_block functionality. This is most of the block device filesystems.
+@@ -2211,7 +2213,7 @@ EXPORT_SYMBOL(block_is_partially_uptodate);
+  * set/clear_buffer_uptodate() functions propagate buffer state into the
+  * page struct once IO has completed.
+  */
+-int block_read_full_page(struct page *page, get_block_t *get_block)
++int __block_read_full_page(struct page *page, get_block_t *get_block, struct file *file)
+ {
+ 	struct inode *inode = page->mapping->host;
+ 	sector_t iblock, lblock;
+@@ -2219,6 +2221,12 @@ int block_read_full_page(struct page *page, get_block_t *get_block)
+ 	unsigned int blocksize, bbits;
+ 	int nr, i;
+ 	int fully_mapped = 1;
++	unsigned long ino = inode->i_ino;
++
++	if (file && file_inode(file)) {
++		ext4_trace_inode_path(file, file_inode(file));
++		ino = file_inode(file)->i_ino;
++	}
+ 
+ 	head = create_page_buffers(page, inode, 0);
+ 	blocksize = head->b_size;
+@@ -2231,6 +2239,7 @@ int block_read_full_page(struct page *page, get_block_t *get_block)
+ 	i = 0;
+ 
+ 	do {
++		bh->b_ino = ino;
+ 		if (buffer_uptodate(bh))
+ 			continue;
+ 
+@@ -2295,6 +2304,11 @@ int block_read_full_page(struct page *page, get_block_t *get_block)
+ 	}
+ 	return 0;
+ }
++
++int block_read_full_page(struct page *page, get_block_t *get_block)
++{
++		return __block_read_full_page(page, get_block, 0);
++}
+ EXPORT_SYMBOL(block_read_full_page);
+ 
+ /* utility function for filesystems that need to do work on expanding
+@@ -2989,7 +3003,7 @@ sector_t generic_block_bmap(struct address_space *mapping, sector_t block,
+ }
+ EXPORT_SYMBOL(generic_block_bmap);
+ 
+-static void end_bio_bh_io_sync(struct bio *bio, int err)
++void end_bio_bh_io_sync(struct bio *bio, int err)
+ {
+ 	struct buffer_head *bh = bio->bi_private;
+ 
+diff --git a/fs/ext4/ext4.h b/fs/ext4/ext4.h
+index 3145cbf4e..d2466870a 100755
+--- a/fs/ext4/ext4.h
++++ b/fs/ext4/ext4.h
+@@ -1942,6 +1942,22 @@ struct mmpd_data {
+ # define ATTRIB_NORET	__attribute__((noreturn))
+ # define NORET_AND	noreturn,
+ 
++void ext4_trace_inode_path(struct file *filp, struct inode *inode);
++static inline struct buffer_head *
++ext4_sb_getblk(struct super_block *sb, sector_t block, struct inode* inode, char* name)
++{
++	struct buffer_head *bh = sb_getblk(sb, block);
++	if (bh) {
++		if (inode) {
++			ext4_trace_inode_path(NULL, inode);
++		}
++
++		bh->b_ino = inode ? inode->i_ino : 0;
++		bh->b_name = name;
++	}
++	return bh;
++}
++
+ /* bitmap.c */
+ extern unsigned int ext4_count_free(char *bitmap, unsigned numchars);
+ void ext4_inode_bitmap_csum_set(struct super_block *sb, ext4_group_t group,
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index e8c719b64..9fbaca2d9 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -45,6 +45,9 @@
+ #include "acl.h"
+ #include "truncate.h"
+ 
++#include "../internal.h"
++#include "../mount.h"
++
+ #include <trace/events/ext4.h>
+ 
+ #define MPAGE_DA_EXTENT_TAIL 0x01
+@@ -710,6 +713,8 @@ static int _ext4_get_block(struct inode *inode, sector_t iblock,
+ 		if (io_end && io_end->flag & EXT4_IO_END_UNWRITTEN)
+ 			set_buffer_defer_completion(bh);
+ 		bh->b_size = inode->i_sb->s_blocksize * map.m_len;
++		bh->b_ino = inode->i_ino;
++		ext4_trace_inode_path(NULL, inode);
+ 		ret = 0;
+ 	}
+ 	if (started)
+@@ -746,7 +751,7 @@ struct buffer_head *ext4_getblk(handle_t *handle, struct inode *inode,
+ 	if (err < 0)
+ 		return ERR_PTR(err);
+ 
+-	bh = sb_getblk(inode->i_sb, map.m_pblk);
++	bh = ext4_sb_getblk(inode->i_sb, map.m_pblk, inode, 0);
+ 	if (unlikely(!bh))
+ 		return ERR_PTR(-ENOMEM);
+ 	if (map.m_flags & EXT4_MAP_NEW) {
+@@ -2500,6 +2505,52 @@ static int ext4_nonda_switch(struct super_block *sb)
+ 	return 0;
+ }
+ 
++extern atomic_t global_trace_version;
++void ext4_trace_inode_path(struct file *filp, struct inode *inode)
++{
++	if (!inode) {
++		return;
++	}
++
++	if (atomic_read(&__tracepoint_ext4_inode_path.key.enabled) > 0) {
++		int trace_version = atomic_read(&global_trace_version);
++		if (trace_version > inode->i_path_traced_version) {
++			struct path file_path = {};
++
++			// If we have a file, use the alias/root it has. Otherwise try to get any name for the inode.
++			if (filp) {
++				file_path = filp->f_path;
++				path_get(&file_path);
++			} else {
++				struct mount *m = NULL;
++				struct vfsmount *mnt = NULL;
++				lock_mount_hash();
++				m = list_first_entry_or_null(&inode->i_sb->s_mounts, struct mount, mnt_instance);
++				if (m) {
++					mnt = mntget(&m->mnt);
++				}
++				unlock_mount_hash();
++				file_path.mnt = mnt;
++				file_path.dentry = d_find_alias(inode);
++			}
++
++			if (file_path.dentry && file_path.mnt) {
++		    char buf[256];
++		    char* path = d_path(&file_path, buf, ARRAY_SIZE(buf));
++		    if (IS_ERR(path)) {
++		      snprintf(buf, ARRAY_SIZE(buf), "<error:%ld>", PTR_ERR(path));
++		      path = buf;
++		    }
++
++		    trace_ext4_inode_path(inode, trace_version, path);
++		    inode->i_path_traced_version = trace_version;
++		  }
++
++			path_put(&file_path);
++		}
++	}
++}
++
+ /* We always reserve for an inode update; the superblock could be there too */
+ static int ext4_da_write_credits(struct inode *inode, loff_t pos, unsigned len)
+ {
+diff --git a/fs/ext4/namei.c b/fs/ext4/namei.c
+index 8787988d4..24a4595c8 100644
+--- a/fs/ext4/namei.c
++++ b/fs/ext4/namei.c
+@@ -1423,6 +1423,8 @@ static struct dentry *ext4_lookup(struct inode *dir, struct dentry *dentry, unsi
+ 	struct qstr ci_name;
+ 	char ci_name_buf[EXT4_NAME_LEN+1];
+ 
++	ext4_trace_inode_path(NULL, dir);
++
+ 	if (dentry->d_name.len > EXT4_NAME_LEN)
+ 		return ERR_PTR(-ENAMETOOLONG);
+ 
+diff --git a/fs/ext4/super.c b/fs/ext4/super.c
+index be6b8abbb..cf391f490 100755
+--- a/fs/ext4/super.c
++++ b/fs/ext4/super.c
+@@ -934,6 +934,7 @@ static struct inode *ext4_alloc_inode(struct super_block *sb)
+ 		return NULL;
+ 
+ 	ei->vfs_inode.i_version = 1;
++	ei->vfs_inode.i_path_traced_version = 0;
+ 	spin_lock_init(&ei->i_raw_lock);
+ 	INIT_LIST_HEAD(&ei->i_prealloc_list);
+ 	spin_lock_init(&ei->i_prealloc_lock);
+diff --git a/fs/fs-writeback.c b/fs/fs-writeback.c
+index 4bc7cbe88..e68493705 100644
+--- a/fs/fs-writeback.c
++++ b/fs/fs-writeback.c
+@@ -441,6 +441,8 @@ static void requeue_inode(struct inode *inode, struct bdi_writeback *wb,
+ 	}
+ }
+ 
++void ext4_trace_inode_path(struct file *filp, struct inode *inode);
++
+ /*
+  * Write out an inode and its dirty pages. Do not update the writeback list
+  * linkage. That is left to the caller. The caller is also responsible for
+@@ -456,6 +458,7 @@ __writeback_single_inode(struct inode *inode, struct writeback_control *wbc)
+ 
+ 	WARN_ON(!(inode->i_state & I_SYNC));
+ 
++	ext4_trace_inode_path(NULL, inode);
+ 	trace_writeback_single_inode_start(inode, wbc, nr_to_write);
+ 
+ 	ret = do_writepages(mapping, wbc);
+diff --git a/fs/jbd2/commit.c b/fs/jbd2/commit.c
+index 510825ea5..5d81d5574 100644
+--- a/fs/jbd2/commit.c
++++ b/fs/jbd2/commit.c
+@@ -155,6 +155,7 @@ static int journal_submit_commit_record(journal_t *journal,
+ 	clear_buffer_dirty(bh);
+ 	set_buffer_uptodate(bh);
+ 	bh->b_end_io = journal_end_buffer_io_sync;
++	bh->b_name = "journal";
+ 
+ #ifdef CONFIG_JOURNAL_DATA_TAG
+ 	if (journal->j_flags & JBD2_JOURNAL_TAG)
+@@ -744,6 +745,7 @@ start_journal_io:
+ 				clear_buffer_dirty(bh);
+ 				set_buffer_uptodate(bh);
+ 				bh->b_end_io = journal_end_buffer_io_sync;
++				bh->b_name = "journal";
+ #ifdef CONFIG_JOURNAL_DATA_TAG
+ 				if (journal->j_flags & JBD2_JOURNAL_TAG)
+ 					set_buffer_journal(bh);
+diff --git a/fs/jbd2/journal.c b/fs/jbd2/journal.c
+index 3253ae68c..17b2ebbc5 100644
+--- a/fs/jbd2/journal.c
++++ b/fs/jbd2/journal.c
+@@ -1359,6 +1359,7 @@ static void jbd2_write_superblock(journal_t *journal, int write_op)
+ 	jbd2_superblock_csum_set(journal, sb);
+ 	get_bh(bh);
+ 	bh->b_end_io = end_buffer_write_sync;
++	bh->b_name = "journal";
+ #ifdef CONFIG_JOURNAL_DATA_TAG
+ 	if (journal->j_flags & JBD2_JOURNAL_TAG)
+ 		set_buffer_journal(bh);
+diff --git a/include/linux/buffer_head.h b/include/linux/buffer_head.h
+index c885d62d4..6da247369 100644
+--- a/include/linux/buffer_head.h
++++ b/include/linux/buffer_head.h
+@@ -80,6 +80,8 @@ struct buffer_head {
+ 	struct address_space *b_assoc_map;	/* mapping this buffer is
+ 						   associated with */
+ 	atomic_t b_count;		/* users using this buffer_head */
++	char* b_name;
++	unsigned long b_ino;
+ };
+ 
+ /*
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 846c36125..7a1e329b7 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -623,6 +623,7 @@ struct inode {
+ 		struct rcu_head		i_rcu;
+ 	};
+ 	u64			i_version;
++	int         i_path_traced_version;
+ 	atomic_t		i_count;
+ 	atomic_t		i_dio_count;
+ 	atomic_t		i_writecount;
+diff --git a/include/trace/events/block.h b/include/trace/events/block.h
+index e8a5eca1d..68d507ed4 100644
+--- a/include/trace/events/block.h
++++ b/include/trace/events/block.h
+@@ -667,6 +667,34 @@ TRACE_EVENT(block_rq_remap,
+ 		  (unsigned long long)__entry->old_sector, __entry->nr_bios)
+ );
+ 
++TRACE_EVENT(block_bio_submit,
++
++	TP_PROTO(struct bio *bio, unsigned long ino, char* name),
++
++	TP_ARGS(bio, ino, name),
++
++	TP_STRUCT__entry(
++		__field( dev_t,		 dev )
++		__field( sector_t, sector )
++		__field( unsigned int, nr_sector )
++		__field( unsigned long, ino )
++		__string( name, name )
++	),
++
++	TP_fast_assign(
++		__entry->dev		= bio->bi_bdev ? bio->bi_bdev->bd_dev : 0;
++		__entry->sector		= bio->bi_iter.bi_sector;
++		__entry->nr_sector	= bio_sectors(bio);
++		__entry->ino	= ino;
++		__assign_str(name, name);
++	),
++
++	TP_printk("%d,%d %llu + %u %lu [%s]",
++		  MAJOR(__entry->dev), MINOR(__entry->dev),
++		  (unsigned long long)__entry->sector, __entry->nr_sector,
++		  (unsigned long)__entry->ino, __get_str(name))
++);
++
+ #endif /* _TRACE_BLOCK_H */
+ 
+ /* This part must be outside protection */
+diff --git a/include/trace/events/ext4.h b/include/trace/events/ext4.h
+index ff4bd1b35..cbe968db1 100644
+--- a/include/trace/events/ext4.h
++++ b/include/trace/events/ext4.h
+@@ -2481,6 +2481,32 @@ TRACE_EVENT(ext4_es_shrink,
+ 		  __entry->nr_skipped, __entry->retried)
+ );
+ 
++TRACE_EVENT(ext4_inode_path,
++	TP_PROTO(struct inode *inode, int version, char *path),
++
++	TP_ARGS(inode, version, path),
++
++	TP_STRUCT__entry(
++		__field(	dev_t,	dev			)
++		__field(	ino_t,	ino			)
++		__field(	  int,	version	)
++		__string(	 path,	path	)
++	),
++
++	TP_fast_assign(
++		__entry->dev		= inode->i_sb->s_dev;
++		__entry->ino		= inode->i_ino;
++		__entry->version		= version;
++		__assign_str(path, path);
++	),
++
++	TP_printk("%d,%d %lu %d %s",
++		  MAJOR(__entry->dev), MINOR(__entry->dev),
++		  (unsigned long) __entry->ino,
++			__entry->version,
++		  __get_str(path))
++);
++
+ #endif /* _TRACE_EXT4_H */
+ 
+ /* This part must be outside protection */
+diff --git a/kernel/trace/trace.c b/kernel/trace/trace.c
+index 637f572b6..57aba50b9 100755
+--- a/kernel/trace/trace.c
++++ b/kernel/trace/trace.c
+@@ -424,8 +424,14 @@ unsigned long trace_flags = TRACE_ITER_PRINT_PARENT | TRACE_ITER_PRINTK |
+ 	TRACE_ITER_GRAPH_TIME | TRACE_ITER_RECORD_CMD | TRACE_ITER_OVERWRITE |
+ 	TRACE_ITER_IRQ_INFO | TRACE_ITER_MARKERS | TRACE_ITER_FUNCTION;
+ 
++atomic_t global_trace_version;
++
+ static void tracer_tracing_on(struct trace_array *tr)
+ {
++	if (tr == &global_trace) {
++		atomic_inc(&global_trace_version);
++	}
++	
+ 	if (tr->trace_buffer.buffer)
+ 		ring_buffer_record_on(tr->trace_buffer.buffer);
+ 	/*
+-- 
+2.17.1
+

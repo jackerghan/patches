@@ -1,0 +1,556 @@
+From a4bb8d20a567d10d064bceda62ba91ec807414fd Mon Sep 17 00:00:00 2001
+From: JackE <jacke@fb.com>
+Date: Mon, 24 Jun 2019 08:18:29 -0700
+Subject: [PATCH 5/5] More universal trampoline support - can be controlled
+ from shell, does not require broadcast
+
+---
+ compiler/driver/compiler_options.h            |   4 +-
+ compiler/image_writer.cc                      |   1 -
+ runtime/Android.mk                            |   1 -
+ runtime/art_method.cc                         |   2 -
+ runtime/art_method.h                          |  28 -----
+ runtime/dex_file.cc                           |   2 +
+ runtime/dex_file.h                            |   3 +
+ .../dalvik_facebook_TrampolineManager.cc      | 103 ----------------
+ .../dalvik_facebook_TrampolineManager.h       |  14 ---
+ runtime/facebook/trampoline_manager-inl.h     |  27 +++--
+ runtime/facebook/trampoline_manager.cc        | 110 ++++++++++++++++--
+ runtime/facebook/trampoline_manager.h         |   3 +
+ runtime/runtime.cc                            |   3 +-
+ 13 files changed, 133 insertions(+), 168 deletions(-)
+ delete mode 100644 runtime/facebook/native/dalvik_facebook_TrampolineManager.cc
+ delete mode 100644 runtime/facebook/native/dalvik_facebook_TrampolineManager.h
+
+diff --git a/compiler/driver/compiler_options.h b/compiler/driver/compiler_options.h
+index 6d4455e65c..44624ac7c3 100644
+--- a/compiler/driver/compiler_options.h
++++ b/compiler/driver/compiler_options.h
+@@ -38,7 +38,7 @@ class CompilerOptions FINAL {
+   static const size_t kDefaultTinyMethodThreshold = 20;
+   static const size_t kDefaultNumDexMethodsThreshold = 900;
+   static constexpr double kDefaultTopKProfileThreshold = 90.0;
+-  static const bool kDefaultGenerateDebugInfo = false;
++  static const bool kDefaultGenerateDebugInfo = true;
+   static const bool kDefaultGenerateMiniDebugInfo = false;
+   static const bool kDefaultIncludePatchInformation = false;
+   static const size_t kDefaultInlineDepthLimit = 3;
+@@ -178,7 +178,7 @@ class CompilerOptions FINAL {
+   }
+ 
+   bool GetGenerateDebugInfo() const {
+-    return generate_debug_info_;
++    return true;
+   }
+ 
+   bool GetGenerateMiniDebugInfo() const {
+diff --git a/compiler/image_writer.cc b/compiler/image_writer.cc
+index c89d9e98fa..da10568475 100644
+--- a/compiler/image_writer.cc
++++ b/compiler/image_writer.cc
+@@ -2114,7 +2114,6 @@ void ImageWriter::CopyAndFixupMethod(ArtMethod* orig,
+   copy->SetDexCacheResolvedMethods(NativeLocationInImage(orig_resolved_methods), target_ptr_size_);
+   GcRoot<mirror::Class>* orig_resolved_types = orig->GetDexCacheResolvedTypes(target_ptr_size_);
+   copy->SetDexCacheResolvedTypes(NativeLocationInImage(orig_resolved_types), target_ptr_size_);
+-  copy->SetProfilerTrampolinePtrSize(nullptr, target_ptr_size_);
+ 
+   // OatWriter replaces the code_ with an offset value. Here we re-adjust to a pointer relative to
+   // oat_begin_
+diff --git a/runtime/Android.mk b/runtime/Android.mk
+index e964ea5c5f..770ea43cab 100644
+--- a/runtime/Android.mk
++++ b/runtime/Android.mk
+@@ -51,7 +51,6 @@ LIBART_COMMON_SRC_FILES := \
+   dex_instruction.cc \
+   elf_file.cc \
+   facebook/trampoline_manager.cc \
+-  facebook/native/dalvik_facebook_TrampolineManager.cc \
+   fault_handler.cc \
+   gc/allocation_record.cc \
+   gc/allocator/dlmalloc.cc \
+diff --git a/runtime/art_method.cc b/runtime/art_method.cc
+index 102c40a77a..f86cb13512 100644
+--- a/runtime/art_method.cc
++++ b/runtime/art_method.cc
+@@ -495,8 +495,6 @@ void ArtMethod::CopyFrom(ArtMethod* src, size_t image_pointer_size) {
+   }
+   // Clear hotness to let the JIT properly decide when to compile this method.
+   hotness_count_ = 0;
+-
+-  SetProfilerTrampolinePtrSize(nullptr, image_pointer_size);
+ }
+ 
+ }  // namespace art
+diff --git a/runtime/art_method.h b/runtime/art_method.h
+index 1e9f362840..a012a5a9ca 100644
+--- a/runtime/art_method.h
++++ b/runtime/art_method.h
+@@ -499,11 +499,6 @@ class ArtMethod FINAL {
+         PtrSizedFields, entry_point_from_quick_compiled_code_) / sizeof(void*) * pointer_size);
+   }
+ 
+-  static MemberOffset ProfilerTrampolineOffset(size_t pointer_size) {
+-    return MemberOffset(PtrSizedFieldsOffset(pointer_size) + OFFSETOF_MEMBER(
+-        PtrSizedFields, profiler_trampoline_) / sizeof(void*) * pointer_size);
+-  }
+-
+   ProfilingInfo* GetProfilingInfo(size_t pointer_size) {
+     return reinterpret_cast<ProfilingInfo*>(GetEntryPointFromJniPtrSize(pointer_size));
+   }
+@@ -546,23 +541,6 @@ class ArtMethod FINAL {
+     SetNativePointer(EntryPointFromJniOffset(pointer_size), entrypoint, pointer_size);
+   }
+ 
+-  void* GetProfilerTrampoline() {
+-    return GetProfilerTrampolinePtrSize(sizeof(void*));
+-  }
+-
+-  void* GetProfilerTrampolinePtrSize(size_t pointer_size) {
+-    return GetNativePointer<void*>(ProfilerTrampolineOffset(pointer_size), pointer_size);
+-  }
+-
+-  void SetProfilerTrampoline(void* trampoline) {
+-    SetProfilerTrampolinePtrSize(trampoline, sizeof(void*));
+-  }
+-
+-  ALWAYS_INLINE void SetProfilerTrampolinePtrSize(const void* trampoline, size_t pointer_size) {
+-    SetNativePointer(ProfilerTrampolineOffset(pointer_size), trampoline, pointer_size);
+-  }
+-
+-
+   // Is this a CalleSaveMethod or ResolutionMethod and therefore doesn't adhere to normal
+   // conventions for a method of managed code. Returns false for Proxy methods.
+   ALWAYS_INLINE bool IsRuntimeMethod();
+@@ -748,12 +726,6 @@ class ArtMethod FINAL {
+     // Method dispatch from quick compiled code invokes this pointer which may cause bridging into
+     // the interpreter.
+     void* entry_point_from_quick_compiled_code_;
+-
+-    // Address of a synthetic C function associated with this ArtFunction. Each time interpreter
+-    // starts interpreting this function the interpreter loop is called through the associated
+-    // trampoline so that native profilers can recognize which functions interpreter is currently
+-    // interpreting.
+-    void* profiler_trampoline_;
+   } ptr_sized_fields_;
+ 
+  private:
+diff --git a/runtime/dex_file.cc b/runtime/dex_file.cc
+index 88696e9640..292c330a5d 100644
+--- a/runtime/dex_file.cc
++++ b/runtime/dex_file.cc
+@@ -452,6 +452,8 @@ DexFile::DexFile(const uint8_t* base, size_t size,
+       lookup_table_.reset(TypeLookupTable::Open(lookup_data, *this));
+     }
+   }
++  
++  trampolines_.resize(NumMethodIds(), 0);
+ }
+ 
+ DexFile::~DexFile() {
+diff --git a/runtime/dex_file.h b/runtime/dex_file.h
+index 638821bfb7..6aaf3afd14 100644
+--- a/runtime/dex_file.h
++++ b/runtime/dex_file.h
+@@ -1277,6 +1277,9 @@ class DexFile {
+ 
+   friend class DexFileVerifierTest;
+   ART_FRIEND_TEST(ClassLinkerTest, RegisterDexFileName);  // for constructor
++public:
++
++  std::vector<void*> trampolines_;
+ };
+ 
+ struct DexFileReference {
+diff --git a/runtime/facebook/native/dalvik_facebook_TrampolineManager.cc b/runtime/facebook/native/dalvik_facebook_TrampolineManager.cc
+deleted file mode 100644
+index 1e1f02e344..0000000000
+--- a/runtime/facebook/native/dalvik_facebook_TrampolineManager.cc
++++ /dev/null
+@@ -1,103 +0,0 @@
+-// Copyright 2004-present Facebook. All Rights Reserved.
+-
+-#include "dalvik_facebook_TrampolineManager.h"
+-
+-#include <sstream>
+-
+-#include "art_method-inl.h"
+-#include "base/macros.h"
+-#include "base/unix_file/fd_file.h"
+-#include "common_throws.h"
+-#include "facebook/trampoline_manager.h"
+-#include "jni_internal.h"
+-#include "os.h"
+-#include "runtime.h"
+-#include "scoped_thread_state_change.h"
+-#include "thread_list.h"
+-#include "ScopedUtfChars.h"
+-
+-namespace art {
+-
+-static void TrampolineManager_dumpTrampolinesToFile(JNIEnv* env, jclass,
+-                                                    jstring java_out_filename) {
+-  ScopedUtfChars out_filename(env, java_out_filename);
+-  if (out_filename.c_str() == nullptr) {
+-    return;
+-  }
+-
+-  std::unique_ptr<File> file(OS::CreateEmptyFileWriteOnly(out_filename.c_str()));
+-  if (!file) {
+-    ScopedObjectAccess soa(env);
+-    ThrowRuntimeException("Unable to open the mapping file '%s'", out_filename.c_str());
+-    return;
+-  }
+-
+-  bool succeeded = [&]() {
+-    // We technically don't need to suspend all the threads, but if we do, then
+-    // we avoid races (trampoline assignment happening at the time of dumping
+-    // the mapping) and we ensure that nothing happens to all of the methods
+-    // we're about to iterate over. Frozing the app while dumping function
+-    // names is not a disadvantage really.
+-    ScopedSuspendAll ssa(__FUNCTION__);
+-    using facebook::TrampolineId;
+-    using facebook::TrampolineManager;
+-    std::map<TrampolineId, ArtMethod*> methods = TrampolineManager::GetTrampolineMappings();
+-
+-    for (auto iter = methods.begin(); iter != methods.end(); ++iter) {
+-      std::ostringstream ss;
+-      ss << iter->first
+-         << " " << iter->second->GetDeclaringClassDescriptor()
+-         << " " << iter->second->GetName()
+-         << " " << iter->second->GetSignature().ToString()
+-         << "\n";
+-      std::string line = ss.str();
+-      if (!file->WriteFully(line.c_str(), line.length())) {
+-        return false;
+-      }
+-    }
+-
+-    return true;
+-  }();
+-
+-  if (file->Flush() != 0) {
+-    PLOG(WARNING) << "Could not flush trampoline mapping file";
+-  }
+-  if (file->Close() != 0) {
+-    PLOG(ERROR) << "Could not close trampoline mapping file";
+-  }
+-
+-  if (!succeeded) {
+-    ScopedObjectAccess soa(env);
+-    ThrowRuntimeException("Unable to write trampoline mappings to '%s'", out_filename.c_str());
+-  }
+-}
+-
+-static void TrampolineManager_enable(JNIEnv* env, jclass) {
+-  (void) env;
+-
+-  // TrampolineManager::Enable requires exclusive ownership of the mutator lock.
+-  ScopedSuspendAll ssa(__FUNCTION__);
+-
+-  facebook::TrampolineManager::Enable();
+-}
+-
+-static void TrampolineManager_disable(JNIEnv* env, jclass) {
+-  (void) env;
+-
+-  // TrampolineManager::Disable requires exclusive ownership of the mutator lock.
+-  ScopedSuspendAll ssa(__FUNCTION__);
+-
+-  facebook::TrampolineManager::Disable();
+-}
+-
+-static JNINativeMethod gMethods[] = {
+-  NATIVE_METHOD(TrampolineManager, dumpTrampolinesToFile, "(Ljava/lang/String;)V"),
+-  NATIVE_METHOD(TrampolineManager, enable, "()V"),
+-  NATIVE_METHOD(TrampolineManager, disable, "()V"),
+-};
+-
+-void register_dalvik_facebook_TrampolineManager(JNIEnv* env) {
+-  REGISTER_NATIVE_METHODS("dalvik/facebook/TrampolineManager");
+-}
+-
+-}  // namespace art
+diff --git a/runtime/facebook/native/dalvik_facebook_TrampolineManager.h b/runtime/facebook/native/dalvik_facebook_TrampolineManager.h
+deleted file mode 100644
+index 5b7ab3ec40..0000000000
+--- a/runtime/facebook/native/dalvik_facebook_TrampolineManager.h
++++ /dev/null
+@@ -1,14 +0,0 @@
+-// Copyright 2004-present Facebook. All Rights Reserved.
+-
+-#ifndef ART_RUNTIME_FACEBOOK_NATIVE_FACEBOOK_ART_TRAMPOLINEMANAGER_H
+-#define ART_RUNTIME_FACEBOOK_NATIVE_FACEBOOK_ART_TRAMPOLINEMANAGER_H
+-
+-#include <jni.h>
+-
+-namespace art {
+-
+-void register_dalvik_facebook_TrampolineManager(JNIEnv* env);
+-
+-}
+-
+-#endif  // ART_RUNTIME_FACEBOOK_NATIVE_FACEBOOK_ART_TRAMPOLINEMANAGER_H
+diff --git a/runtime/facebook/trampoline_manager-inl.h b/runtime/facebook/trampoline_manager-inl.h
+index b0e7a4aa4c..e09f6fb61a 100644
+--- a/runtime/facebook/trampoline_manager-inl.h
++++ b/runtime/facebook/trampoline_manager-inl.h
+@@ -10,6 +10,15 @@
+ namespace art {
+ namespace facebook {
+ 
++Trampoline* TrampolineManager::GetAssignedTrampoline(ArtMethod* method) {
++  uint32_t dex_method_index = method->GetDexMethodIndex();
++  DexFile* dex_file = (DexFile*)method->GetDexFile();
++  if (dex_method_index >= dex_file->trampolines_.size()) {
++    return nullptr;
++  }
++  return (Trampoline*)dex_file->trampolines_[dex_method_index];
++}
++
+ Trampoline* TrampolineManager::GetTrampoline(ArtMethod* method) {
+   if (Runtime::Current()->IsAotCompiler()) {
+     // AOT compiler might be configured to run with target word size. If 64-bit
+@@ -28,14 +37,16 @@ Trampoline* TrampolineManager::GetTrampoline(ArtMethod* method) {
+   if (!enabled_) {
+     return nullptr;
+   }
+-
+-  // Address of the trampoline is cached in the ArtMethod itself. If the cached
+-  // value is not equal to null then we just return that. Otherwise we have to
+-  // delegate to AssignTrampoline which performs the global state modification
+-  // necessary to keep track of free/used trampolines.
+-  if (void* trampoline = method->GetProfilerTrampoline()) {
+-    // Cache hit
+-    return reinterpret_cast<Trampoline*>(trampoline);
++  
++  // No trampolines for runtime methods, no dex file to cache them for now...
++  uint32_t dex_method_index = method->GetDexMethodIndex();
++  if (dex_method_index == DexFile::kDexNoIndex) {
++    return nullptr;
++  }
++  
++  Trampoline* trampoline = GetAssignedTrampoline(method);
++  if (trampoline != nullptr) {
++    return trampoline;
+   }
+ 
+   return AssignTrampoline(method);
+diff --git a/runtime/facebook/trampoline_manager.cc b/runtime/facebook/trampoline_manager.cc
+index d4a4c9b6a3..9c3dd87e63 100644
+--- a/runtime/facebook/trampoline_manager.cc
++++ b/runtime/facebook/trampoline_manager.cc
+@@ -12,10 +12,24 @@
+ 
+ #ifdef __ANDROID__
+ #include "cutils/properties.h"
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++#include <unistd.h>
+ #endif
+ 
+-namespace art {
++#include "art_method-inl.h"
++#include "base/macros.h"
++#include "base/unix_file/fd_file.h"
++#include "common_throws.h"
++#include "jni_internal.h"
++#include "os.h"
++#include "runtime.h"
++#include "scoped_thread_state_change.h"
++#include "thread_list.h"
+ 
++namespace art {
++  
+ namespace interpreter {
+ extern JValue ExecuteImpl(
+     Thread* self,
+@@ -23,7 +37,7 @@ extern JValue ExecuteImpl(
+     ShadowFrame& shadow_frame,
+     JValue result_register) SHARED_REQUIRES(Locks::mutator_lock_);
+ }
+-
++  
+ namespace facebook {
+ 
+ #define REPEAT_THIS_MACRO(N)                                            \
+@@ -51,8 +65,13 @@ static constexpr TrampolineId kOverflowTrampolineId = kTrampolineCount - 1;
+ bool TrampolineManager::enabled_;
+ 
+ Trampoline* TrampolineManager::AssignTrampoline(ArtMethod* method) {
+-  TrampolineId id = next_trampoline_id_.FetchAndAddRelaxed(1);
++  uint32_t dex_method_index = method->GetDexMethodIndex();
++  DexFile* dex_file = (DexFile*)method->GetDexFile();
++  if (dex_method_index >= dex_file->trampolines_.size()) {
++    return nullptr;
++  }
+ 
++  TrampolineId id = next_trampoline_id_.FetchAndAddRelaxed(1);
+   if (id >= kTrampolineCount) {
+     // We run out of valid trampolines. In this case we assign the last
+     // trampoline to all of the remaining functions. We still want to
+@@ -62,7 +81,7 @@ Trampoline* TrampolineManager::AssignTrampoline(ArtMethod* method) {
+   }
+ 
+   Trampoline* trampoline = trampolines_[id];
+-  method->SetProfilerTrampoline(reinterpret_cast<void*>(trampoline));
++  dex_file->trampolines_[dex_method_index] = (void*)trampoline;
+   return trampoline;
+ }
+ 
+@@ -91,8 +110,8 @@ class BuildTrampolineMappingVisitor : public ClassVisitor {
+   }
+ 
+  private:
+-  void VisitMethod(ArtMethod* method) {
+-    if (void* trampoline_address = method->GetProfilerTrampoline()) {
++  void VisitMethod(ArtMethod* method) REQUIRES(Locks::mutator_lock_) {
++    if (void* trampoline_address = (void*)TrampolineManager::GetAssignedTrampoline(method)) {
+       auto trampoline_id_iterator = reverse_map_.find(trampoline_address);
+       DCHECK(trampoline_id_iterator != reverse_map_.end());
+       TrampolineId id = trampoline_id_iterator->second;
+@@ -127,11 +146,88 @@ std::map<TrampolineId, ArtMethod*> TrampolineManager::GetTrampolineMappings() {
+ void TrampolineManager::Init() {
+ #ifdef __ANDROID__
+   enabled_ = property_get_bool("dalvik.facebook.trampolines", false);
+-
+   LOG(INFO) << "Initialized TrampolineManager: interpreter trampolines are "
+             << (enabled_ ? "enabled" : "disabled");
+ #endif
+ }
+ 
++void TrampolineManager::StartListener() {
++#ifdef __ANDROID__
++  // Create a raw pthread to listen to the pipe for commands.
++  pthread_t pthread = {};
++  CHECK_PTHREAD_CALL(pthread_create, (&pthread, nullptr, &CommandThread, nullptr), "TrampolineListener");
++#endif
++}
++
++void* TrampolineManager::CommandThread(void*) {
++#ifdef __ANDROID__
++  Runtime* runtime = Runtime::Current();
++  CHECK(runtime->AttachCurrentThread("TrampolineCommand", true, runtime->GetSystemThreadGroup(), false));
++  Thread* self = Thread::Current();
++  ScopedThreadStateChange tscNative(self, kNative);
++  
++  char pipe_path[256];
++  snprintf(pipe_path, sizeof(pipe_path), "/data/local/tmp/trmp/cmd_%d", getpid());
++  char out_path[256];
++  snprintf(out_path, sizeof(out_path), "/data/local/tmp/trmp/out_%d", getpid());
++
++  mknod(pipe_path, S_IFIFO | 0666, 0);
++  int fd = -1;
++  for (;;) {
++    if (fd < 0) {
++      ScopedThreadStateChange tscWait(self, kWaitingInMainSignalCatcherLoop);
++      fd = open(pipe_path, O_RDONLY);
++      if (fd < 0) {
++        LOG(ERROR) << "TrampolineManager could not open command pipe: " << pipe_path;
++      }
++    }
++
++    if (fd >= 0) {
++      char buffer[256];
++      int num = 0;
++      {
++        ScopedThreadStateChange tscWait(self, kWaitingInMainSignalCatcherLoop);
++        num = read(fd, buffer, sizeof(buffer));
++      }
++
++      if (num < 0) {
++        LOG(ERROR) << "TrampolineManager could not read pipe " << pipe_path;
++      } else if (num == 0) {
++        close(fd);
++        fd = -1;
++      } else {
++        buffer[num] = '\0';
++        LOG(INFO) << "TrampolineManager got command [" << getpid() << "] " << buffer;
++        if (strncmp(buffer, "dump", 4) == 0) {
++          LOG(INFO) << "TrampolineManager dumping to " << out_path;
++          FILE* out = fopen(out_path, "w");
++          if (out != NULL) {
++            ScopedSuspendAll ssa(__FUNCTION__);
++            using facebook::TrampolineId;
++            std::map<TrampolineId, ArtMethod*> methods = TrampolineManager::GetTrampolineMappings();
++            for (auto iter = methods.begin(); iter != methods.end(); ++iter) {
++              if (iter->first == kOverflowTrampolineId) {
++                fprintf(out, "%u Overflow Overflow Overflow\n", iter->first);
++              } else {
++                fprintf(out, "%u %s %s %s\n", iter->first,
++                  iter->second->GetDeclaringClassDescriptor(),
++                  iter->second->GetName(),
++                  iter->second->GetSignature().ToString().c_str());
++              }
++            }
++            fclose(out);
++          } else {
++            LOG(ERROR) << "TrampolineManager could not open output file: " << out_path;
++          }
++        }
++      }
++    }
++    usleep(100 * 1000);
++  }
++#else
++  return 0;
++#endif
++}
++
+ }  // namespace facebook
+ }  // namespace art
+diff --git a/runtime/facebook/trampoline_manager.h b/runtime/facebook/trampoline_manager.h
+index 494494ceb6..ff412c0eee 100644
+--- a/runtime/facebook/trampoline_manager.h
++++ b/runtime/facebook/trampoline_manager.h
+@@ -22,6 +22,7 @@ class TrampolineManager {
+  public:
+ 
+   static Trampoline* GetTrampoline(ArtMethod* method) SHARED_REQUIRES(Locks::mutator_lock_);
++  static Trampoline* GetAssignedTrampoline(ArtMethod* method) SHARED_REQUIRES(Locks::mutator_lock_);
+   static std::map<TrampolineId, ArtMethod*> GetTrampolineMappings() REQUIRES(Locks::mutator_lock_);
+ 
+   // For the sake of speed checks whether TrampolineManager is enabled or
+@@ -35,9 +36,11 @@ class TrampolineManager {
+   static void Disable() REQUIRES(Locks::mutator_lock_);
+ 
+   static void Init();
++  static void StartListener();
+  private:
+   static bool enabled_;
+   static Trampoline* AssignTrampoline(ArtMethod* method) SHARED_REQUIRES(Locks::mutator_lock_);
++  static void* CommandThread(void* arg);
+ 
+   DISALLOW_IMPLICIT_CONSTRUCTORS(TrampolineManager);
+ };
+diff --git a/runtime/runtime.cc b/runtime/runtime.cc
+index b197cb7c5f..b5ae317b71 100644
+--- a/runtime/runtime.cc
++++ b/runtime/runtime.cc
+@@ -66,7 +66,6 @@
+ #include "entrypoints/runtime_asm_entrypoints.h"
+ #include "experimental_flags.h"
+ #include "facebook/trampoline_manager.h"
+-#include "facebook/native/dalvik_facebook_TrampolineManager.h"
+ #include "fault_handler.h"
+ #include "gc/accounting/card_table-inl.h"
+ #include "gc/heap.h"
+@@ -737,6 +736,7 @@ void Runtime::InitNonZygoteOrPostFork(
+   }
+ 
+   StartSignalCatcher();
++  facebook::TrampolineManager::StartListener();
+ 
+   // Start the JDWP thread. If the command-line debugger flags specified "suspend=y",
+   // this will pause the runtime, so we probably want this to come last.
+@@ -1369,7 +1369,6 @@ void Runtime::RegisterRuntimeNativeMethods(JNIEnv* env) {
+   register_dalvik_system_VMRuntime(env);
+   register_dalvik_system_VMStack(env);
+   register_dalvik_system_ZygoteHooks(env);
+-  register_dalvik_facebook_TrampolineManager(env);
+   register_java_lang_Class(env);
+   register_java_lang_DexCache(env);
+   register_java_lang_Object(env);
+-- 
+2.17.1
+

@@ -1,0 +1,194 @@
+From df28fa88905483b7ae72f04f97543274f93e76c7 Mon Sep 17 00:00:00 2001
+From: Michal Gregorczyk <michalgr@fb.com>
+Date: Thu, 13 Sep 2018 07:37:15 -0700
+Subject: [PATCH 3/5] Allow for dynamic enabling/disabling of trampolines
+
+Summary:
+`dalvik.facebook.TrampolineManager` has enable/disable functions which this diff
+finally implements.
+
+There is an interesting synchronization scheme. To avoid any additional
+synchronization in the interpreter code when reading enabled/disabled
+state and to avoid races (like some thread not using trampolines
+immediately) I decided to force the following scheme:
+- to read enabled/disabled state shared ownership of the mutator lock is required
+- to write enabled/disabled state exclusive ownership of the mutator lock is required
+
+Test Plan: build AOSP, flush it and do some profiling + dump some trampolines !
+
+Reviewers: slinger
+
+Reviewed By: slinger
+
+Differential Revision: https://phabricator.intern.facebook.com/D9811498
+
+Signature: 9811498:1536894919:f7d7a767cfb122b3307a3fbd33b73c1cfc2aaedd
+---
+ .../dalvik_facebook_TrampolineManager.cc      | 20 +++++++++++++++++
+ runtime/facebook/trampoline_manager-inl.h     | 12 ++++++++++
+ runtime/facebook/trampoline_manager.cc        | 22 +++++++++++++++++++
+ runtime/facebook/trampoline_manager.h         | 12 ++++++++++
+ runtime/runtime.cc                            |  3 +++
+ 5 files changed, 69 insertions(+)
+
+diff --git a/runtime/facebook/native/dalvik_facebook_TrampolineManager.cc b/runtime/facebook/native/dalvik_facebook_TrampolineManager.cc
+index 7051e33540..1e1f02e344 100644
+--- a/runtime/facebook/native/dalvik_facebook_TrampolineManager.cc
++++ b/runtime/facebook/native/dalvik_facebook_TrampolineManager.cc
+@@ -72,8 +72,28 @@ static void TrampolineManager_dumpTrampolinesToFile(JNIEnv* env, jclass,
+   }
+ }
+ 
++static void TrampolineManager_enable(JNIEnv* env, jclass) {
++  (void) env;
++
++  // TrampolineManager::Enable requires exclusive ownership of the mutator lock.
++  ScopedSuspendAll ssa(__FUNCTION__);
++
++  facebook::TrampolineManager::Enable();
++}
++
++static void TrampolineManager_disable(JNIEnv* env, jclass) {
++  (void) env;
++
++  // TrampolineManager::Disable requires exclusive ownership of the mutator lock.
++  ScopedSuspendAll ssa(__FUNCTION__);
++
++  facebook::TrampolineManager::Disable();
++}
++
+ static JNINativeMethod gMethods[] = {
+   NATIVE_METHOD(TrampolineManager, dumpTrampolinesToFile, "(Ljava/lang/String;)V"),
++  NATIVE_METHOD(TrampolineManager, enable, "()V"),
++  NATIVE_METHOD(TrampolineManager, disable, "()V"),
+ };
+ 
+ void register_dalvik_facebook_TrampolineManager(JNIEnv* env) {
+diff --git a/runtime/facebook/trampoline_manager-inl.h b/runtime/facebook/trampoline_manager-inl.h
+index 2efbb737f4..b0e7a4aa4c 100644
+--- a/runtime/facebook/trampoline_manager-inl.h
++++ b/runtime/facebook/trampoline_manager-inl.h
+@@ -25,6 +25,10 @@ Trampoline* TrampolineManager::GetTrampoline(ArtMethod* method) {
+     return nullptr;
+   }
+ 
++  if (!enabled_) {
++    return nullptr;
++  }
++
+   // Address of the trampoline is cached in the ArtMethod itself. If the cached
+   // value is not equal to null then we just return that. Otherwise we have to
+   // delegate to AssignTrampoline which performs the global state modification
+@@ -37,6 +41,14 @@ Trampoline* TrampolineManager::GetTrampoline(ArtMethod* method) {
+   return AssignTrampoline(method);
+ }
+ 
++void TrampolineManager::Enable() {
++  enabled_ = true;
++}
++
++void TrampolineManager::Disable() {
++  enabled_ = false;
++}
++
+ }  // namespace facebook
+ }  // namespace art
+ 
+diff --git a/runtime/facebook/trampoline_manager.cc b/runtime/facebook/trampoline_manager.cc
+index 226b6a40c5..80a902ce0d 100644
+--- a/runtime/facebook/trampoline_manager.cc
++++ b/runtime/facebook/trampoline_manager.cc
+@@ -5,10 +5,15 @@
+ #include <unordered_map>
+ #include <utility>
+ 
++#include "base/logging.h"
+ #include "class_linker.h"
+ #include "mirror/class.h"
+ #include "mirror/class-inl.h"
+ 
++#ifdef __ANDROID__
++#include "cutils/properties.h"
++#endif
++
+ namespace art {
+ 
+ namespace interpreter {
+@@ -43,6 +48,8 @@ static Trampoline* const trampolines_[kTrampolineCount] = {
+ static Atomic<TrampolineId> next_trampoline_id_;
+ static constexpr TrampolineId kOverflowTrampolineId = kTrampolineCount - 1;
+ 
++bool TrampolineManager::enabled_;
++
+ Trampoline* TrampolineManager::AssignTrampoline(ArtMethod* method) {
+   TrampolineId id = next_trampoline_id_.FetchAndAddRelaxed(1);
+ 
+@@ -117,5 +124,20 @@ std::map<TrampolineId, ArtMethod*> TrampolineManager::GetTrampolineMappings() {
+   return out;
+ }
+ 
++void TrampolineManager::Init() {
++#ifdef __ANDROID__
++  // Check whether there's a system property overriding the max number of records.
++  const char* propertyName = "dalvik.facebook.trampolines";
++  char allocMaxString[PROPERTY_VALUE_MAX];
++
++  if (property_get(propertyName, allocMaxString, "") == 4) {
++    enabled_ = strncpy(allocMaxString, "true", 4);
++  }
++
++  LOG(INFO) << "Initialized TrampolineManager: interpreter trampolines are "
++            << (enabled_ ? "enabled" : "disabled");
++#endif
++}
++
+ }  // namespace facebook
+ }  // namespace art
+diff --git a/runtime/facebook/trampoline_manager.h b/runtime/facebook/trampoline_manager.h
+index dab0f961af..494494ceb6 100644
+--- a/runtime/facebook/trampoline_manager.h
++++ b/runtime/facebook/trampoline_manager.h
+@@ -24,7 +24,19 @@ class TrampolineManager {
+   static Trampoline* GetTrampoline(ArtMethod* method) SHARED_REQUIRES(Locks::mutator_lock_);
+   static std::map<TrampolineId, ArtMethod*> GetTrampolineMappings() REQUIRES(Locks::mutator_lock_);
+ 
++  // For the sake of speed checks whether TrampolineManager is enabled or
++  // disabled do not involve any locking or memory synchronization. At the same
++  // time we really don't want to miss any stacks from threads that do not see
++  // updated state after Enable returns. To make sure that does not happen we
++  // require exclusive ownership of Locks::mutator_lock_ when modifying
++  // enabled/disabled state and shared ownership when reading that state.
++  // It makes Enable/Disable slow but checking the state free.
++  static void Enable() REQUIRES(Locks::mutator_lock_);
++  static void Disable() REQUIRES(Locks::mutator_lock_);
++
++  static void Init();
+  private:
++  static bool enabled_;
+   static Trampoline* AssignTrampoline(ArtMethod* method) SHARED_REQUIRES(Locks::mutator_lock_);
+ 
+   DISALLOW_IMPLICIT_CONSTRUCTORS(TrampolineManager);
+diff --git a/runtime/runtime.cc b/runtime/runtime.cc
+index 1cc5cfbfa2..b197cb7c5f 100644
+--- a/runtime/runtime.cc
++++ b/runtime/runtime.cc
+@@ -65,6 +65,7 @@
+ #include "elf_file.h"
+ #include "entrypoints/runtime_asm_entrypoints.h"
+ #include "experimental_flags.h"
++#include "facebook/trampoline_manager.h"
+ #include "facebook/native/dalvik_facebook_TrampolineManager.h"
+ #include "fault_handler.h"
+ #include "gc/accounting/card_table-inl.h"
+@@ -1279,6 +1280,8 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
+ 
+   VLOG(startup) << "Runtime::Init exiting";
+ 
++  facebook::TrampolineManager::Init();
++
+   return true;
+ }
+ 
+-- 
+2.17.1
+

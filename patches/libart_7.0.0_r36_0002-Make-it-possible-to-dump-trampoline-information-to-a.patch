@@ -1,0 +1,290 @@
+From 1670bb13459f4a7b80eaecb0fa5085e876a879ed Mon Sep 17 00:00:00 2001
+From: Michal Gregorczyk <michalgr@fb.com>
+Date: Wed, 12 Sep 2018 10:50:39 -0700
+Subject: [PATCH 2/5] Make it possible to dump trampoline information to a text
+ file.
+
+Summary:
+This diff adds code responsible for reporting trampoline id -> java
+function mapping.
+
+Instead of building id -> ArtMethod mapping as trampolines are assigned I
+chose to build it entirely after the profiling is done. To make this happen
+we first suspend all the java threads and then use ClassLinker to iterate
+over all linked Java classes and their methods and write that information
+to a file.
+
+I guess the suspension is not strictly necessary, but it does not hurt and
+ensures that no new trampolines are added while we write data to the output
+file.
+
+Test Plan: checkout the last diff, build AOSP, profile fb4a
+
+Reviewers: slinger
+
+Reviewed By: slinger
+
+Differential Revision: https://phabricator.intern.facebook.com/D9810988
+
+Signature: 9810988:1536894600:9e2d87d5295992ee91c82e647e9f04fce9ae1f71
+---
+ runtime/Android.mk                            |  1 +
+ .../dalvik_facebook_TrampolineManager.cc      | 83 +++++++++++++++++++
+ .../dalvik_facebook_TrampolineManager.h       | 14 ++++
+ runtime/facebook/trampoline_manager.cc        | 64 ++++++++++++++
+ runtime/facebook/trampoline_manager.h         |  4 +-
+ runtime/runtime.cc                            |  2 +
+ 6 files changed, 167 insertions(+), 1 deletion(-)
+ create mode 100644 runtime/facebook/native/dalvik_facebook_TrampolineManager.cc
+ create mode 100644 runtime/facebook/native/dalvik_facebook_TrampolineManager.h
+
+diff --git a/runtime/Android.mk b/runtime/Android.mk
+index 770ea43cab..e964ea5c5f 100644
+--- a/runtime/Android.mk
++++ b/runtime/Android.mk
+@@ -51,6 +51,7 @@ LIBART_COMMON_SRC_FILES := \
+   dex_instruction.cc \
+   elf_file.cc \
+   facebook/trampoline_manager.cc \
++  facebook/native/dalvik_facebook_TrampolineManager.cc \
+   fault_handler.cc \
+   gc/allocation_record.cc \
+   gc/allocator/dlmalloc.cc \
+diff --git a/runtime/facebook/native/dalvik_facebook_TrampolineManager.cc b/runtime/facebook/native/dalvik_facebook_TrampolineManager.cc
+new file mode 100644
+index 0000000000..7051e33540
+--- /dev/null
++++ b/runtime/facebook/native/dalvik_facebook_TrampolineManager.cc
+@@ -0,0 +1,83 @@
++// Copyright 2004-present Facebook. All Rights Reserved.
++
++#include "dalvik_facebook_TrampolineManager.h"
++
++#include <sstream>
++
++#include "art_method-inl.h"
++#include "base/macros.h"
++#include "base/unix_file/fd_file.h"
++#include "common_throws.h"
++#include "facebook/trampoline_manager.h"
++#include "jni_internal.h"
++#include "os.h"
++#include "runtime.h"
++#include "scoped_thread_state_change.h"
++#include "thread_list.h"
++#include "ScopedUtfChars.h"
++
++namespace art {
++
++static void TrampolineManager_dumpTrampolinesToFile(JNIEnv* env, jclass,
++                                                    jstring java_out_filename) {
++  ScopedUtfChars out_filename(env, java_out_filename);
++  if (out_filename.c_str() == nullptr) {
++    return;
++  }
++
++  std::unique_ptr<File> file(OS::CreateEmptyFileWriteOnly(out_filename.c_str()));
++  if (!file) {
++    ScopedObjectAccess soa(env);
++    ThrowRuntimeException("Unable to open the mapping file '%s'", out_filename.c_str());
++    return;
++  }
++
++  bool succeeded = [&]() {
++    // We technically don't need to suspend all the threads, but if we do, then
++    // we avoid races (trampoline assignment happening at the time of dumping
++    // the mapping) and we ensure that nothing happens to all of the methods
++    // we're about to iterate over. Frozing the app while dumping function
++    // names is not a disadvantage really.
++    ScopedSuspendAll ssa(__FUNCTION__);
++    using facebook::TrampolineId;
++    using facebook::TrampolineManager;
++    std::map<TrampolineId, ArtMethod*> methods = TrampolineManager::GetTrampolineMappings();
++
++    for (auto iter = methods.begin(); iter != methods.end(); ++iter) {
++      std::ostringstream ss;
++      ss << iter->first
++         << " " << iter->second->GetDeclaringClassDescriptor()
++         << " " << iter->second->GetName()
++         << " " << iter->second->GetSignature().ToString()
++         << "\n";
++      std::string line = ss.str();
++      if (!file->WriteFully(line.c_str(), line.length())) {
++        return false;
++      }
++    }
++
++    return true;
++  }();
++
++  if (file->Flush() != 0) {
++    PLOG(WARNING) << "Could not flush trampoline mapping file";
++  }
++  if (file->Close() != 0) {
++    PLOG(ERROR) << "Could not close trampoline mapping file";
++  }
++
++  if (!succeeded) {
++    ScopedObjectAccess soa(env);
++    ThrowRuntimeException("Unable to write trampoline mappings to '%s'", out_filename.c_str());
++  }
++}
++
++static JNINativeMethod gMethods[] = {
++  NATIVE_METHOD(TrampolineManager, dumpTrampolinesToFile, "(Ljava/lang/String;)V"),
++};
++
++void register_dalvik_facebook_TrampolineManager(JNIEnv* env) {
++  REGISTER_NATIVE_METHODS("dalvik/facebook/TrampolineManager");
++}
++
++}  // namespace art
+diff --git a/runtime/facebook/native/dalvik_facebook_TrampolineManager.h b/runtime/facebook/native/dalvik_facebook_TrampolineManager.h
+new file mode 100644
+index 0000000000..5b7ab3ec40
+--- /dev/null
++++ b/runtime/facebook/native/dalvik_facebook_TrampolineManager.h
+@@ -0,0 +1,14 @@
++// Copyright 2004-present Facebook. All Rights Reserved.
++
++#ifndef ART_RUNTIME_FACEBOOK_NATIVE_FACEBOOK_ART_TRAMPOLINEMANAGER_H
++#define ART_RUNTIME_FACEBOOK_NATIVE_FACEBOOK_ART_TRAMPOLINEMANAGER_H
++
++#include <jni.h>
++
++namespace art {
++
++void register_dalvik_facebook_TrampolineManager(JNIEnv* env);
++
++}
++
++#endif  // ART_RUNTIME_FACEBOOK_NATIVE_FACEBOOK_ART_TRAMPOLINEMANAGER_H
+diff --git a/runtime/facebook/trampoline_manager.cc b/runtime/facebook/trampoline_manager.cc
+index efd1a0139d..226b6a40c5 100644
+--- a/runtime/facebook/trampoline_manager.cc
++++ b/runtime/facebook/trampoline_manager.cc
+@@ -1,8 +1,14 @@
+ // Copyright 2004-present Facebook. All Rights Reserved.
+ 
+ #include "trampoline_manager.h"
++
++#include <unordered_map>
+ #include <utility>
+ 
++#include "class_linker.h"
++#include "mirror/class.h"
++#include "mirror/class-inl.h"
++
+ namespace art {
+ 
+ namespace interpreter {
+@@ -53,5 +59,63 @@ Trampoline* TrampolineManager::AssignTrampoline(ArtMethod* method) {
+   return trampoline;
+ }
+ 
++// Instead of building the trampoline -> ArtMethod mapping as trampolines are
++// assigned we just wait until the profiling is done and build that mapping on
++// demand. To do that we visit all the classes ClassLinker is aware of and
++// we iterate through all of the direct and virtual methods.
++class BuildTrampolineMappingVisitor : public ClassVisitor {
++ public:
++  explicit BuildTrampolineMappingVisitor(
++      const std::unordered_map<void*, TrampolineId>& reverse_map,
++      std::map<TrampolineId, ArtMethod*>& methods)
++      : reverse_map_(reverse_map),
++        methods_(methods) {};
++
++  bool operator()(mirror::Class* klass) OVERRIDE REQUIRES(Locks::mutator_lock_) {
++    for (ArtMethod& m : klass->GetDirectMethods(sizeof(void*))) {
++      VisitMethod(&m);
++    }
++
++    for (ArtMethod& m : klass->GetMethods(sizeof(void*))) {
++      VisitMethod(&m);
++    }
++
++    return true;
++  }
++
++ private:
++  void VisitMethod(ArtMethod* method) {
++    if (void* trampoline_address = method->GetProfilerTrampoline()) {
++      auto trampoline_id_iterator = reverse_map_.find(trampoline_address);
++      DCHECK(trampoline_id_iterator != reverse_map_.end());
++      TrampolineId id = trampoline_id_iterator->second;
++      if (void* old_method = methods_[id]) {
++        DCHECK(old_method == method);
++      }
++      methods_[id] = method;
++    }
++  }
++
++  const std::unordered_map<void*, TrampolineId>& reverse_map_;
++  std::map<TrampolineId, ArtMethod*>& methods_;
++};
++
++std::map<TrampolineId, ArtMethod*> TrampolineManager::GetTrampolineMappings() {
++  std::map<TrampolineId, ArtMethod*> out;
++
++  // ideally trampolines would be placed in memory at consecutive addresses, but
++  // we don't enforce that. Because of that we need to build a reverse address
++  // to id map.
++  std::unordered_map<void*, TrampolineId> reverse_map;
++  for (TrampolineId i = 0; i < kTrampolineCount; i++) {
++    reverse_map[reinterpret_cast<void*>(trampolines_[i])] = i;
++  }
++
++  BuildTrampolineMappingVisitor visitor(reverse_map, out);
++  Runtime::Current()->GetClassLinker()->VisitClasses(&visitor);
++
++  return out;
++}
++
+ }  // namespace facebook
+ }  // namespace art
+diff --git a/runtime/facebook/trampoline_manager.h b/runtime/facebook/trampoline_manager.h
+index 18ce2cd88e..dab0f961af 100644
+--- a/runtime/facebook/trampoline_manager.h
++++ b/runtime/facebook/trampoline_manager.h
+@@ -3,8 +3,9 @@
+ #ifndef ART_FACEBOOK_RUNTIME_TRAMPOLINE_MANAGER_H_
+ #define ART_FACEBOOK_RUNTIME_TRAMPOLINE_MANAGER_H_
+ 
++#include <map>
++
+ #include "art_method.h"
+-#include <array>
+ 
+ namespace art {
+ namespace facebook {
+@@ -21,6 +22,7 @@ class TrampolineManager {
+  public:
+ 
+   static Trampoline* GetTrampoline(ArtMethod* method) SHARED_REQUIRES(Locks::mutator_lock_);
++  static std::map<TrampolineId, ArtMethod*> GetTrampolineMappings() REQUIRES(Locks::mutator_lock_);
+ 
+  private:
+   static Trampoline* AssignTrampoline(ArtMethod* method) SHARED_REQUIRES(Locks::mutator_lock_);
+diff --git a/runtime/runtime.cc b/runtime/runtime.cc
+index 3f7d570531..1cc5cfbfa2 100644
+--- a/runtime/runtime.cc
++++ b/runtime/runtime.cc
+@@ -65,6 +65,7 @@
+ #include "elf_file.h"
+ #include "entrypoints/runtime_asm_entrypoints.h"
+ #include "experimental_flags.h"
++#include "facebook/native/dalvik_facebook_TrampolineManager.h"
+ #include "fault_handler.h"
+ #include "gc/accounting/card_table-inl.h"
+ #include "gc/heap.h"
+@@ -1365,6 +1366,7 @@ void Runtime::RegisterRuntimeNativeMethods(JNIEnv* env) {
+   register_dalvik_system_VMRuntime(env);
+   register_dalvik_system_VMStack(env);
+   register_dalvik_system_ZygoteHooks(env);
++  register_dalvik_facebook_TrampolineManager(env);
+   register_java_lang_Class(env);
+   register_java_lang_DexCache(env);
+   register_java_lang_Object(env);
+-- 
+2.17.1
+

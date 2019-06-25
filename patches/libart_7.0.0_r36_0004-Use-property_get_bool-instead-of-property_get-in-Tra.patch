@@ -1,0 +1,43 @@
+From d2d263aa60331f939debffb1470aaed361669da5 Mon Sep 17 00:00:00 2001
+From: Michal Gregorczyk <michalgr@fb.com>
+Date: Mon, 24 Sep 2018 13:42:34 -0700
+Subject: [PATCH 4/5] Use property_get_bool instead of property_get in
+ TrampolineManager
+
+Summary: This addresses a review comment on D9811498
+
+Test Plan: build aosp and test it with the rest of diffs
+
+Reviewers: rfitz, slinger, xun, jonaldislarry
+
+Reviewed By: slinger
+
+Differential Revision: https://phabricator.intern.facebook.com/D10017717
+
+Signature: 10017717:1537822615:143933523c68fdf4e174d81ea43a7e990797a6a2
+---
+ runtime/facebook/trampoline_manager.cc | 8 +-------
+ 1 file changed, 1 insertion(+), 7 deletions(-)
+
+diff --git a/runtime/facebook/trampoline_manager.cc b/runtime/facebook/trampoline_manager.cc
+index 80a902ce0d..d4a4c9b6a3 100644
+--- a/runtime/facebook/trampoline_manager.cc
++++ b/runtime/facebook/trampoline_manager.cc
+@@ -126,13 +126,7 @@ std::map<TrampolineId, ArtMethod*> TrampolineManager::GetTrampolineMappings() {
+ 
+ void TrampolineManager::Init() {
+ #ifdef __ANDROID__
+-  // Check whether there's a system property overriding the max number of records.
+-  const char* propertyName = "dalvik.facebook.trampolines";
+-  char allocMaxString[PROPERTY_VALUE_MAX];
+-
+-  if (property_get(propertyName, allocMaxString, "") == 4) {
+-    enabled_ = strncpy(allocMaxString, "true", 4);
+-  }
++  enabled_ = property_get_bool("dalvik.facebook.trampolines", false);
+ 
+   LOG(INFO) << "Initialized TrampolineManager: interpreter trampolines are "
+             << (enabled_ ? "enabled" : "disabled");
+-- 
+2.17.1
+
