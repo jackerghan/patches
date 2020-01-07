@@ -1,0 +1,50 @@
+From 3a0126fdd01bab7473c1866d947c84db2196f0a4 Mon Sep 17 00:00:00 2001
+From: JackE <jacke@fb.com>
+Date: Mon, 6 Jan 2020 16:02:54 -0800
+Subject: [PATCH] ADBD don't enter minijail as root on factory images to allow
+ adb root to work
+
+---
+ adb/daemon/main.cpp | 19 +------------------
+ 1 file changed, 1 insertion(+), 18 deletions(-)
+
+diff --git a/adb/daemon/main.cpp b/adb/daemon/main.cpp
+index 4721e2f..600067a 100644
+--- a/adb/daemon/main.cpp
++++ b/adb/daemon/main.cpp
+@@ -81,7 +81,7 @@ static bool should_drop_privileges() {
+     bool ro_secure = (strcmp(value, "1") == 0);
+ 
+     property_get("ro.debuggable", value, "");
+-    bool ro_debuggable = (strcmp(value, "1") == 0);
++    bool ro_debuggable = true;
+ 
+     // Drop privileges if ro.secure is set...
+     bool drop = ro_secure;
+@@ -139,23 +139,6 @@ static void drop_privileges(int server_port) {
+         minijail_enter(jail.get());
+ 
+         D("Local port disabled");
+-    } else {
+-        // minijail_enter() will abort if any priv-dropping step fails.
+-        minijail_enter(jail.get());
+-
+-        if (root_seclabel != nullptr) {
+-            if (selinux_android_setcon(root_seclabel) < 0) {
+-                LOG(FATAL) << "Could not set SELinux context";
+-            }
+-        }
+-        std::string error;
+-        std::string local_name =
+-            android::base::StringPrintf("tcp:%d", server_port);
+-        if (install_listener(local_name, "*smartsocket*", nullptr, 0,
+-                             &error)) {
+-            LOG(FATAL) << "Could not install *smartsocket* listener: "
+-                       << error;
+-        }
+     }
+ }
+ 
+-- 
+2.17.1
+
